@@ -13,11 +13,26 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 from pyvesc.VESC.VESC import VESC
 
+from pyvesc.VESC.messages.getters import (
+    GetValuesExp,
+    GetBikeRuntime,
+    GetBikeSimParams,
+    GetControlParams
+)
+from pyvesc.VESC.messages.setters import (
+    SetBikeRuntime,
+    SetBikeSimParams,
+    SetControlParams
+)
+
 
 # =========================
 # Global state
 # =========================
 DEBUG = False
+
+# Parameter actual-value polling period
+PARAM_REFRESH_PERIOD_S = 2.0
 
 
 def dprint(*args, **kwargs):
@@ -27,11 +42,6 @@ def dprint(*args, **kwargs):
 
 vesc_com_flag = threading.Event()   # user wants communication
 prog_flag = threading.Event()
-freewheel = threading.Event()
-freewheel.set()
-
-pumptrack = threading.Event()
-pumptrack.clear()
 
 vesc_values = {}
 vesc_values_lock = threading.Lock()
@@ -63,9 +73,9 @@ sample_counter_lock = threading.Lock()
 READ_ONLY_MODE = False
 ENABLE_COMMANDS = True
 
-TELEMETRY_PERIOD_S = 0.1
+TELEMETRY_PERIOD_S = 0.025
 COMMAND_KEEPALIVE_S = 0.5
-TX_GUARD_S = 0.02
+TX_GUARD_S = 0.0125
 REOPEN_BACKOFF_S = 3.0
 
 SOFT_TIMEOUT_LIMIT = 3
@@ -153,35 +163,20 @@ def debug_list_ports():
 
 
 # =========================
-# Parameter definitions
+# Shared session / parameter state
 # =========================
-PARAM_DEFS = [
-    (1, "gear_ratio_bike"),
-    (2, "p_air_ro"),
-    (3, "p_c_rr"),
-    (4, "p_weight"),
-    (5, "p_As"),
-    (6, "p_c_air"),
-    (7, "p_c_bw"),
-    (8, "p_c_wl"),
-    (9, "p_wheel_radius"),
-    (10, "p_r_bearings"),
-    (11, "p_k_v_bw"),
-    (12, "p_k_area"),
-    (13, "p_height"),
-    (14, "p_fo_hz"),
-    (15, "p_gz_hz"),
-    (16, "p_fc_TLPF"),
-    (17, "p_adrc_scale"),
-    (18, "p_kp_pos"),
-    (19, "p_ki_pos"),
-    (20, "p_kd_pos"),
-    (21, "p_J"),
-    (22, "p_incline_deg"),
-    (23, "p_mech_gearing"),
-    (24, "pumptrack_enabled"),
-    (25, "freewheel_enabled"),
-]
+vesc_session = None
+vesc_session_lock = threading.RLock()
+
+param_state_lock = threading.Lock()
+param_state = {
+    "runtime": {},
+    "bike": {},
+    "control": {},
+    "pending_initial_refresh": False,
+    "ui_sync_needed": False,
+    "ui_sync_update_targets": False,
+}
 
 
 # =========================
@@ -194,9 +189,7 @@ def estimate_real_speed_kmh(erpm, gear_ratio):
             return 0.0
 
         gearing = GM / gear_ratio
-
         motor_mech_radps = (float(erpm) / POLE_PAIRS) * (2.0 * math.pi / 60.0)
-
         speed_mps = motor_mech_radps * WHEEL_RADIUS_M / gearing
         return speed_mps * 3.6
     except Exception:
@@ -248,6 +241,8 @@ def build_vesc_values(response):
         "F_combine": getattr(response, "f_combine", 0.0),
         "UW Theta": uw_theta,
         "Pedal Torque Observed": getattr(response, "tp_observed", 0.0),
+        "Torque Motor": -getattr(response, "torque_motor", 0.0),
+        "Torque FF": -getattr(response, "torque_ff", 0.0),
         "Param Index": getattr(response, "param_index", 0),
         "Param Value": getattr(response, "param_from_index", 0.0),
         "Pos Term Speed": getattr(response, "pos_term_speed", 0.0),
@@ -273,7 +268,12 @@ def response_summary(response):
         rpm = getattr(response, "rpm", None)
         v_in = getattr(response, "v_in", None)
         status_bits_ext = getattr(response, "status_bits_ext", None)
-        return f"rpm={rpm}, v_in={v_in}, status_bits_ext={status_bits_ext}"
+        torque_motor = getattr(response, "torque_motor", None)
+        torque_ff = getattr(response, "torque_ff", None)
+        return (
+            f"rpm={rpm}, v_in={v_in}, status_bits_ext={status_bits_ext}, "
+            f"torque_motor={torque_motor}, torque_ff={torque_ff}"
+        )
     except Exception:
         return "<unavailable>"
 
@@ -314,6 +314,55 @@ def append_history(values_dict):
         for key, value in numeric_items.items():
             vesc_history[key].append(value)
 
+
+def get_active_vesc_session():
+    with vesc_session_lock:
+        return vesc_session
+
+def read_param_blocks_from_session(vesc, update_targets=False):
+    runtime = vesc.get_bike_runtime()
+    bike = vesc.get_bike_sim_params()
+    control = vesc.get_control_params()
+
+    with param_state_lock:
+        param_state["runtime"] = {
+            "gear_ratio_bike": float(runtime.gear_ratio_bike),
+            "incline_deg": float(runtime.incline_deg),
+            "pumptrack_enabled": bool(runtime.pumptrack_enabled),
+            "freewheel_enabled": bool(runtime.freewheel_enabled),
+            "pumptrack_period_min": float(runtime.pumptrack_period_min),
+        }
+        param_state["bike"] = {
+            "p_air_ro": float(bike.p_air_ro),
+            "p_c_rr": float(bike.p_c_rr),
+            "p_weight": float(bike.p_weight),
+            "p_As": float(bike.p_As),
+            "p_c_air": float(bike.p_c_air),
+            "p_c_bw": float(bike.p_c_bw),
+            "p_c_wl": float(bike.p_c_wl),
+            "p_wheel_radius": float(bike.p_wheel_radius),
+            "p_mech_gearing": float(bike.p_mech_gearing),
+            "p_r_bearings": float(bike.p_r_bearings),
+            "p_k_v_bw": float(bike.p_k_v_bw),
+            "p_J": float(bike.p_J),
+            "p_B": float(bike.p_B),
+            "p_k_area": float(bike.p_k_area),
+            "p_height": float(bike.p_height),
+            "p_speed_limit_pos_control_activation": float(bike.p_speed_limit_pos_control_activation),
+        }
+        param_state["control"] = {
+            "p_fo_hz": float(control.p_fo_hz),
+            "p_gz_hz": float(control.p_gz_hz),
+            "p_fc_TLPF": float(control.p_fc_TLPF),
+            "p_adrc_scale": float(control.p_adrc_scale),
+            "p_sched_spd_floor": float(control.p_sched_spd_floor),
+            "p_sched_pos_floor": float(control.p_sched_pos_floor),
+            "p_sched_pos_dead_erpm": float(control.p_sched_pos_dead_erpm),
+            "p_sched_spd_sat_erpm": float(control.p_sched_spd_sat_erpm),
+            "p_sched_pos_sat_erpm": float(control.p_sched_pos_sat_erpm),
+        }
+        param_state["ui_sync_needed"] = True
+        param_state["ui_sync_update_targets"] = bool(update_targets)
 
 # =========================
 # Small UI helpers
@@ -393,35 +442,56 @@ class ReadableFlag(QtWidgets.QWidget):
         self.flag.set_active(active)
 
 
-class ParamBox(QtWidgets.QGroupBox):
-    def __init__(self, param_index, param_name):
-        super().__init__(param_name)
-        self.param_index = param_index
-        self.param_name = param_name
-
-        font = QtGui.QFont()
-        font.setPointSize(8)
-        self.setFont(font)
+class ParamEditRow(QtWidgets.QWidget):
+    def __init__(self, label_text, is_bool=False):
+        super().__init__()
+        self.is_bool = is_bool
 
         layout = QtWidgets.QGridLayout(self)
-        layout.setContentsMargins(4, 4, 4, 4)
-        layout.setHorizontalSpacing(4)
-        layout.setVerticalSpacing(3)
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setHorizontalSpacing(8)
+        layout.setVerticalSpacing(2)
 
-        self.edit_target = QtWidgets.QLineEdit()
-        self.edit_target.setPlaceholderText("set value")
+        self.label = QtWidgets.QLabel(label_text)
+        self.label.setMinimumWidth(220)
 
-        self.edit_actual = QtWidgets.QLineEdit()
-        self.edit_actual.setReadOnly(True)
-        self.edit_actual.setPlaceholderText("actual value")
+        if is_bool:
+            self.edit_target = QtWidgets.QCheckBox()
+            self.edit_actual = QtWidgets.QCheckBox()
+            self.edit_actual.setEnabled(False)
+        else:
+            self.edit_target = QtWidgets.QLineEdit()
+            self.edit_actual = QtWidgets.QLineEdit()
+            self.edit_actual.setReadOnly(True)
 
-        self.edit_target.setMinimumHeight(22)
-        self.edit_actual.setMinimumHeight(22)
+            self.edit_target.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+            self.edit_actual.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
 
-        layout.addWidget(QtWidgets.QLabel("Set"), 0, 0)
+            self.edit_target.setMinimumWidth(90)
+            self.edit_target.setMaximumWidth(110)
+            self.edit_actual.setMinimumWidth(90)
+            self.edit_actual.setMaximumWidth(110)
+
+        layout.addWidget(self.label, 0, 0)
         layout.addWidget(self.edit_target, 0, 1)
-        layout.addWidget(QtWidgets.QLabel("Act"), 1, 0)
-        layout.addWidget(self.edit_actual, 1, 1)
+        layout.addWidget(self.edit_actual, 0, 2)
+
+    def set_actual(self, value):
+        if self.is_bool:
+            self.edit_actual.setChecked(bool(value))
+        else:
+            self.edit_actual.setText(f"{float(value):.6f}")
+
+    def set_target(self, value):
+        if self.is_bool:
+            self.edit_target.setChecked(bool(value))
+        else:
+            self.edit_target.setText(f"{float(value):.6f}")
+
+    def get_target(self):
+        if self.is_bool:
+            return bool(self.edit_target.isChecked())
+        return float(self.edit_target.text().strip())
 
 
 class PopupChartsWindow(QtWidgets.QMainWindow):
@@ -470,9 +540,11 @@ class PopupChartsWindow(QtWidgets.QMainWindow):
         self.curve_popup_leso_rpm = self.plot_popup_rpms.plot(pen=pg.mkPen('m', width=1.2), name='LESO RPM')
 
         self.plot_popup_torques = parent_ui.make_plot(self.plotWidgetPopup, 0, 2, "Torques")
-        self.curve_popup_tf = self.plot_popup_torques.plot(pen=pg.mkPen('y', width=1.2), name='T_friction')
+        self.curve_popup_torque_ff = self.plot_popup_torques.plot(pen=pg.mkPen((255, 165, 0), width=1.2), name='-Torque FF')
+        self.curve_popup_torque_motor = self.plot_popup_torques.plot(pen=pg.mkPen('g', width=1.2), name='-Torque Motor')
         self.curve_popup_tp_obs = self.plot_popup_torques.plot(pen=pg.mkPen('c', width=1.2), name='Tp_Observed')
         self.curve_popup_tf_combine = self.plot_popup_torques.plot(pen=pg.mkPen('m', width=1.2), name='T_F_combine')
+        self.curve_popup_tf = self.plot_popup_torques.plot(pen=pg.mkPen('y', width=1.2), name='T_friction')
 
         self.plot_popup_errors = parent_ui.make_plot(self.plotWidgetPopup, 0, 3, "Errors")
         self.curve_popup_speed_error = self.plot_popup_errors.plot(pen=pg.mkPen('r', width=1.2), name='Speed Error')
@@ -514,7 +586,7 @@ class PopupChartsWindow(QtWidgets.QMainWindow):
         self.btn_popup_mouse.clicked.connect(
             lambda: self.parent_ui.toggle_plot_mouse(self.popup_plots, self.btn_popup_mouse)
         )
-
+        
     def zoom_fit_popup(self):
         self.popup_scroll_mode = False
         self.parent_ui.autorange_plots(self.popup_plots)
@@ -551,7 +623,6 @@ class Ui_MainWindow(object):
         self.centralwidget = QtWidgets.QWidget(MainWindow)
         MainWindow.setCentralWidget(self.centralwidget)
 
-        self.param_boxes = {}
         self.chart_tabs_1 = []
         self.chart_tabs_2 = []
         self.popup_window = None
@@ -651,27 +722,39 @@ class Ui_MainWindow(object):
         top_boxes_row = QtWidgets.QHBoxLayout()
         top_boxes_row.setSpacing(6)
 
-        modes_box = QtWidgets.QGroupBox("Modes")
-        modes_box.setMaximumHeight(120)
-        modes_layout = QtWidgets.QVBoxLayout(modes_box)
-        modes_layout.setContentsMargins(6, 6, 6, 6)
-        modes_layout.setSpacing(4)
+        runtime_box = QtWidgets.QGroupBox("Runtime")
+        runtime_layout = QtWidgets.QGridLayout(runtime_box)
+        runtime_layout.setContentsMargins(6, 6, 6, 6)
+        runtime_layout.setHorizontalSpacing(6)
+        runtime_layout.setVerticalSpacing(4)
 
-        self.radioButton_freewheel = QtWidgets.QCheckBox("Freewheeling enabled")
-        self.radioButton_freewheel.setChecked(True)
-        self.checkBox_pumptrack = QtWidgets.QCheckBox("Pump track enabled")
-        self.checkBox_pumptrack.setChecked(False)
+        runtime_header_name = QtWidgets.QLabel("Parameter")
+        runtime_header_set = QtWidgets.QLabel("Set")
+        runtime_header_act = QtWidgets.QLabel("Actual")
+        runtime_header_name.setStyleSheet("font-weight: bold;")
+        runtime_header_set.setStyleSheet("font-weight: bold;")
+        runtime_header_act.setStyleSheet("font-weight: bold;")
 
-        font_mode = QtGui.QFont()
-        font_mode.setPointSize(10)
-        self.radioButton_freewheel.setFont(font_mode)
-        self.checkBox_pumptrack.setFont(font_mode)
+        runtime_layout.addWidget(runtime_header_name, 0, 0)
+        runtime_layout.addWidget(runtime_header_set, 0, 1)
+        runtime_layout.addWidget(runtime_header_act, 0, 2)
 
-        modes_layout.addWidget(self.radioButton_freewheel)
-        modes_layout.addWidget(self.checkBox_pumptrack)
+        self.runtime_gear_ratio = ParamEditRow("Gear Ratio Bike")
+        self.runtime_incline_deg = ParamEditRow("Incline Deg")
+        self.runtime_pumptrack_period = ParamEditRow("Pumptrack Period [min]")
+        self.runtime_pumptrack_enabled = ParamEditRow("Pumptrack Enabled", is_bool=True)
+        self.runtime_freewheel_enabled = ParamEditRow("Freewheel Enabled", is_bool=True)
+        self.btn_set_runtime = QtWidgets.QPushButton("Set Runtime")
+
+        runtime_layout.addWidget(self.runtime_gear_ratio, 1, 0, 1, 3)
+        runtime_layout.addWidget(self.runtime_incline_deg, 2, 0, 1, 3)
+        runtime_layout.addWidget(self.runtime_pumptrack_period, 3, 0, 1, 3)
+        runtime_layout.addWidget(self.runtime_pumptrack_enabled, 4, 0, 1, 3)
+        runtime_layout.addWidget(self.runtime_freewheel_enabled, 5, 0, 1, 3)
+        runtime_layout.addWidget(self.btn_set_runtime, 6, 0, 1, 3)
 
         flags_box = QtWidgets.QGroupBox("Status Flags")
-        flags_box.setMaximumHeight(120)
+        flags_box.setMaximumHeight(170)
         flags_layout = QtWidgets.QGridLayout(flags_box)
         flags_layout.setContentsMargins(6, 6, 6, 6)
         flags_layout.setHorizontalSpacing(10)
@@ -692,7 +775,7 @@ class Ui_MainWindow(object):
         flags_layout.addWidget(self.flag_enable, 2, 1)
 
         live_box = QtWidgets.QGroupBox("Live Values")
-        live_box.setMaximumHeight(120)
+        live_box.setMaximumHeight(170)
         live_layout = QtWidgets.QVBoxLayout(live_box)
         live_layout.setContentsMargins(6, 4, 6, 4)
         live_layout.setSpacing(1)
@@ -708,7 +791,7 @@ class Ui_MainWindow(object):
         live_layout.addWidget(self.row_power)
 
         debug_box = QtWidgets.QGroupBox("Runtime Health")
-        debug_box.setMaximumHeight(120)
+        debug_box.setMaximumHeight(170)
         debug_layout = QtWidgets.QVBoxLayout(debug_box)
         debug_layout.setContentsMargins(6, 4, 6, 4)
         debug_layout.setSpacing(1)
@@ -723,7 +806,7 @@ class Ui_MainWindow(object):
         debug_layout.addWidget(self.row_read_errors)
         debug_layout.addWidget(self.row_session)
 
-        top_boxes_row.addWidget(modes_box, 1)
+        top_boxes_row.addWidget(runtime_box, 2)
         top_boxes_row.addWidget(flags_box, 2)
         top_boxes_row.addWidget(live_box, 1)
         top_boxes_row.addWidget(debug_box, 1)
@@ -744,7 +827,6 @@ class Ui_MainWindow(object):
         )
 
         self.main_plot_speed.setXLink(self.main_plot_torque)
-
         self.main_plot_torque.getAxis('bottom').setLabel("")
         self.main_plot_torque.getAxis('bottom').setStyle(showValues=False)
 
@@ -787,9 +869,11 @@ class Ui_MainWindow(object):
         self.curve_leso_omega = self.plot_erpms.plot(pen=pg.mkPen('m', width=1.2), name='LESO RPM')
 
         self.plot_torques = self.make_plot(self.plotWidget1, 1, 0, "Torques")
-        self.curve_tf = self.plot_torques.plot(pen=pg.mkPen('y', width=1.2), name='T_friction')
+        self.curve_torque_ff = self.plot_torques.plot(pen=pg.mkPen((255, 165, 0), width=1.2), name='-Torque FF')
+        self.curve_torque_motor = self.plot_torques.plot(pen=pg.mkPen('g', width=1.2), name='-Torque Motor')
         self.curve_tp_obs = self.plot_torques.plot(pen=pg.mkPen('c', width=1.2), name='Tp_Observed')
         self.curve_tf_combine = self.plot_torques.plot(pen=pg.mkPen('m', width=1.2), name='T_F_combine')
+        self.curve_tf = self.plot_torques.plot(pen=pg.mkPen('y', width=1.2), name='T_friction')
 
         self.plot_errors = self.make_plot(self.plotWidget1, 1, 1, "Errors")
         self.curve_speed_error = self.plot_errors.plot(pen=pg.mkPen('r', width=1.2), name='Speed Error')
@@ -854,37 +938,117 @@ class Ui_MainWindow(object):
         layout.setContentsMargins(2, 2, 2, 2)
         layout.setSpacing(4)
 
-        button_row = QtWidgets.QHBoxLayout()
-        self.btn_params_read_all = QtWidgets.QPushButton("Read All")
-        self.btn_params_set_all = QtWidgets.QPushButton("Set All")
-        self.btn_params_update_set_all = QtWidgets.QPushButton("Update Set All")
+        self.params_tabs = QtWidgets.QTabWidget()
+        layout.addWidget(self.params_tabs)
 
-        button_row.addWidget(self.btn_params_read_all)
-        button_row.addWidget(self.btn_params_set_all)
-        button_row.addWidget(self.btn_params_update_set_all)
-        button_row.addStretch(1)
-        layout.addLayout(button_row)
+        self.tab_params_bike = QtWidgets.QWidget()
+        self.tab_params_advanced = QtWidgets.QWidget()
 
-        scroll = QtWidgets.QScrollArea()
-        scroll.setWidgetResizable(True)
+        self.params_tabs.addTab(self.tab_params_bike, "Bike")
+        self.params_tabs.addTab(self.tab_params_advanced, "Advanced")
 
-        content = QtWidgets.QWidget()
-        grid = QtWidgets.QGridLayout(content)
-        grid.setContentsMargins(4, 4, 4, 4)
-        grid.setHorizontalSpacing(6)
-        grid.setVerticalSpacing(6)
+        bike_layout = QtWidgets.QVBoxLayout(self.tab_params_bike)
+        bike_layout.setContentsMargins(6, 6, 6, 6)
+        bike_layout.setSpacing(4)
 
-        cols = 4
-        for n, (idx, name) in enumerate(PARAM_DEFS):
-            box = ParamBox(idx, name)
-            self.param_boxes[idx] = box
+        bike_header = QtWidgets.QHBoxLayout()
+        hdr1 = QtWidgets.QLabel("Parameter")
+        hdr2 = QtWidgets.QLabel("Set")
+        hdr3 = QtWidgets.QLabel("Actual")
+        hdr1.setStyleSheet("font-weight: bold;")
+        hdr2.setStyleSheet("font-weight: bold;")
+        hdr3.setStyleSheet("font-weight: bold;")
+        hdr1.setMinimumWidth(220)
+        bike_header.addWidget(hdr1)
+        bike_header.addSpacing(8)
+        bike_header.addWidget(hdr2)
+        bike_header.addSpacing(40)
+        bike_header.addWidget(hdr3)
+        bike_header.addStretch(1)
+        bike_layout.addLayout(bike_header)
 
-            r = n // cols
-            c = n % cols
-            grid.addWidget(box, r, c)
+        bike_scroll = QtWidgets.QScrollArea()
+        bike_scroll.setWidgetResizable(True)
+        bike_content = QtWidgets.QWidget()
+        bike_grid = QtWidgets.QGridLayout(bike_content)
+        bike_grid.setContentsMargins(4, 4, 4, 4)
+        bike_grid.setHorizontalSpacing(8)
+        bike_grid.setVerticalSpacing(4)
 
-        scroll.setWidget(content)
-        layout.addWidget(scroll)
+        self.bike_param_rows = {
+            "p_air_ro": ParamEditRow("p_air_ro"),
+            "p_c_rr": ParamEditRow("p_c_rr"),
+            "p_weight": ParamEditRow("p_weight"),
+            "p_As": ParamEditRow("p_As"),
+            "p_c_air": ParamEditRow("p_c_air"),
+            "p_c_bw": ParamEditRow("p_c_bw"),
+            "p_c_wl": ParamEditRow("p_c_wl"),
+            "p_wheel_radius": ParamEditRow("p_wheel_radius"),
+            "p_mech_gearing": ParamEditRow("p_mech_gearing"),
+            "p_r_bearings": ParamEditRow("p_r_bearings"),
+            "p_k_v_bw": ParamEditRow("p_k_v_bw"),
+            "p_J": ParamEditRow("p_J"),
+            "p_B": ParamEditRow("p_B"),
+            "p_k_area": ParamEditRow("p_k_area"),
+            "p_height": ParamEditRow("p_height"),
+            "p_speed_limit_pos_control_activation": ParamEditRow("p_speed_limit_pos_control_activation"),
+        }
+
+        for r, (_k, row_widget) in enumerate(self.bike_param_rows.items()):
+            bike_grid.addWidget(row_widget, r, 0)
+
+        bike_scroll.setWidget(bike_content)
+        self.btn_set_bike_params = QtWidgets.QPushButton("Set Bike Params")
+        bike_layout.addWidget(bike_scroll)
+        bike_layout.addWidget(self.btn_set_bike_params)
+
+        adv_layout = QtWidgets.QVBoxLayout(self.tab_params_advanced)
+        adv_layout.setContentsMargins(6, 6, 6, 6)
+        adv_layout.setSpacing(4)
+
+        adv_header = QtWidgets.QHBoxLayout()
+        ah1 = QtWidgets.QLabel("Parameter")
+        ah2 = QtWidgets.QLabel("Set")
+        ah3 = QtWidgets.QLabel("Actual")
+        ah1.setStyleSheet("font-weight: bold;")
+        ah2.setStyleSheet("font-weight: bold;")
+        ah3.setStyleSheet("font-weight: bold;")
+        ah1.setMinimumWidth(220)
+        adv_header.addWidget(ah1)
+        adv_header.addSpacing(8)
+        adv_header.addWidget(ah2)
+        adv_header.addSpacing(40)
+        adv_header.addWidget(ah3)
+        adv_header.addStretch(1)
+        adv_layout.addLayout(adv_header)
+
+        adv_scroll = QtWidgets.QScrollArea()
+        adv_scroll.setWidgetResizable(True)
+        adv_content = QtWidgets.QWidget()
+        adv_grid = QtWidgets.QGridLayout(adv_content)
+        adv_grid.setContentsMargins(4, 4, 4, 4)
+        adv_grid.setHorizontalSpacing(8)
+        adv_grid.setVerticalSpacing(4)
+        
+        self.control_param_rows = {
+            "p_fo_hz": ParamEditRow("p_fo_hz"),
+            "p_gz_hz": ParamEditRow("p_gz_hz"),
+            "p_fc_TLPF": ParamEditRow("p_fc_TLPF"),
+            "p_adrc_scale": ParamEditRow("p_adrc_scale"),
+            "p_sched_spd_floor": ParamEditRow("p_sched_spd_floor"),
+            "p_sched_pos_floor": ParamEditRow("p_sched_pos_floor"),
+            "p_sched_pos_dead_erpm": ParamEditRow("p_sched_pos_dead_erpm"),
+            "p_sched_spd_sat_erpm": ParamEditRow("p_sched_spd_sat_erpm"),
+            "p_sched_pos_sat_erpm": ParamEditRow("p_sched_pos_sat_erpm"),
+        }
+
+        for r, (_k, row_widget) in enumerate(self.control_param_rows.items()):
+            adv_grid.addWidget(row_widget, r, 0)
+
+        adv_scroll.setWidget(adv_content)
+        self.btn_set_control_params = QtWidgets.QPushButton("Set Advanced Params")
+        adv_layout.addWidget(adv_scroll)
+        adv_layout.addWidget(self.btn_set_control_params)
 
     def build_telemetry_tab(self):
         layout = QtWidgets.QVBoxLayout(self.tab_telemetry)
@@ -939,8 +1103,9 @@ class Ui_MainWindow(object):
         self.Reset.clicked.connect(self.reset_prog)
         self.pushButton_popup_charts.clicked.connect(self.open_popup_charts)
 
-        self.radioButton_freewheel.clicked.connect(self.set_freewheel)
-        self.checkBox_pumptrack.clicked.connect(self.set_pumptrack)
+        self.btn_set_runtime.clicked.connect(self.set_runtime_params_clicked)
+        self.btn_set_bike_params.clicked.connect(self.set_bike_params_clicked)
+        self.btn_set_control_params.clicked.connect(self.set_control_params_clicked)
 
         self.btn_c1_autorange.clicked.connect(lambda: self.autorange_plots(self.chart_tabs_1))
         self.btn_c1_zoomfit.clicked.connect(lambda: self.zoom_fit_plots(self.chart_tabs_1, 1))
@@ -956,28 +1121,12 @@ class Ui_MainWindow(object):
         self.btn_c2_reset_y.clicked.connect(lambda: self.reset_plots_y(self.chart_tabs_2))
         self.btn_c2_mouse.clicked.connect(lambda: self.toggle_plot_mouse(self.chart_tabs_2, self.btn_c2_mouse))
 
-        self.btn_params_read_all.clicked.connect(self.read_all_parameters)
-        self.btn_params_set_all.clicked.connect(self.set_all_parameters)
-        self.btn_params_update_set_all.clicked.connect(self.update_set_all_parameters)
-
     def open_popup_charts(self):
         if self.popup_window is None:
             self.popup_window = PopupChartsWindow(self)
         self.popup_window.show()
         self.popup_window.raise_()
         self.popup_window.activateWindow()
-
-    def set_freewheel(self):
-        if self.radioButton_freewheel.isChecked():
-            freewheel.set()
-        else:
-            freewheel.clear()
-
-    def set_pumptrack(self):
-        if self.checkBox_pumptrack.isChecked():
-            pumptrack.set()
-        else:
-            pumptrack.clear()
 
     def refresh_ports(self):
         self.comboBox_portselect.clear()
@@ -1000,6 +1149,10 @@ class Ui_MainWindow(object):
         selected_port = self.comboBox_portselect.itemData(idx)
 
         if selected_port:
+            with param_state_lock:
+                param_state["pending_initial_refresh"] = True
+                param_state["ui_sync_needed"] = False
+                param_state["ui_sync_update_targets"] = False
             set_diag(selected_port=selected_port)
             log_event(f"Connect requested on {selected_port}")
             vesc_com_flag.set()
@@ -1009,7 +1162,10 @@ class Ui_MainWindow(object):
             log_event("Connect requested but no valid port selected")
 
     def stop_com(self):
+        global vesc_session
         vesc_com_flag.clear()
+        with vesc_session_lock:
+            vesc_session = None
         set_diag(serial_open=False)
         log_event("Communication stopped by user")
         self.statusbar.showMessage("Communication stopped")
@@ -1058,6 +1214,14 @@ class Ui_MainWindow(object):
         with vesc_values_lock:
             vesc_values.clear()
 
+        with param_state_lock:
+            param_state["runtime"] = {}
+            param_state["bike"] = {}
+            param_state["control"] = {}
+            param_state["ui_sync_needed"] = False
+            param_state["ui_sync_update_targets"] = False
+            param_state["pending_initial_refresh"] = False
+
         with sample_counter_lock:
             sample_counter = 0
 
@@ -1075,6 +1239,8 @@ class Ui_MainWindow(object):
                 self.popup_window.curve_popup_tf,
                 self.popup_window.curve_popup_tp_obs,
                 self.popup_window.curve_popup_tf_combine,
+                self.popup_window.curve_popup_torque_motor,
+                self.popup_window.curve_popup_torque_ff,
                 self.popup_window.curve_popup_speed_error,
                 self.popup_window.curve_popup_pos_term_speed,
                 self.popup_window.curve_popup_model_speed,
@@ -1090,59 +1256,122 @@ class Ui_MainWindow(object):
         log_event("Reset done")
         self.statusbar.showMessage("Reset done")
 
-    def read_parameter(self, param_index):
-        with vesc_values_lock:
-            local_values = dict(vesc_values)
+    def apply_param_state_to_ui(self):
+        with param_state_lock:
+            runtime = dict(param_state["runtime"])
+            bike = dict(param_state["bike"])
+            control = dict(param_state["control"])
+            needs_sync = bool(param_state["ui_sync_needed"])
+            update_targets = bool(param_state["ui_sync_update_targets"])
+            param_state["ui_sync_needed"] = False
+            param_state["ui_sync_update_targets"] = False
 
-        box = self.param_boxes[param_index]
-        current_idx = int(local_values.get("Param Index", -1))
-        current_value = float(local_values.get("Param Value", 0.0))
+        if not needs_sync:
+            return
 
-        if current_idx == param_index:
-            box.edit_actual.setText(f"{current_value:.6f}")
-            self.statusbar.showMessage(f"Read parameter {param_index} from live telemetry")
-        else:
-            self.statusbar.showMessage(f"Param {param_index}: no direct read command implemented yet")
+        if runtime:
+            self.runtime_gear_ratio.set_actual(runtime.get("gear_ratio_bike", 0.0))
+            self.runtime_incline_deg.set_actual(runtime.get("incline_deg", 0.0))
+            self.runtime_pumptrack_period.set_actual(runtime.get("pumptrack_period_min", 0.0))
+            self.runtime_pumptrack_enabled.set_actual(runtime.get("pumptrack_enabled", False))
+            self.runtime_freewheel_enabled.set_actual(runtime.get("freewheel_enabled", False))
 
-    def apply_parameter(self, param_index):
-        box = self.param_boxes[param_index]
-        target = box.edit_target.text().strip()
+            if update_targets:
+                self.runtime_gear_ratio.set_target(runtime.get("gear_ratio_bike", 0.0))
+                self.runtime_incline_deg.set_target(runtime.get("incline_deg", 0.0))
+                self.runtime_pumptrack_period.set_target(runtime.get("pumptrack_period_min", 0.0))
+                self.runtime_pumptrack_enabled.set_target(runtime.get("pumptrack_enabled", False))
+                self.runtime_freewheel_enabled.set_target(runtime.get("freewheel_enabled", False))
 
-        if not target:
-            return False
+        for key, row in self.bike_param_rows.items():
+            if key in bike:
+                row.set_actual(bike[key])
+                if update_targets:
+                    row.set_target(bike[key])
+
+        for key, row in self.control_param_rows.items():
+            if key in control:
+                row.set_actual(control[key])
+                if update_targets:
+                    row.set_target(control[key])
+
+    def set_runtime_params_clicked(self):
+        session = get_active_vesc_session()
+        if session is None:
+            self.statusbar.showMessage("No active VESC session")
+            return
 
         try:
-            float(target)
-        except ValueError:
-            return False
+            msg = SetBikeRuntime()
+            msg.gear_ratio_bike = self.runtime_gear_ratio.get_target()
+            msg.incline_deg = self.runtime_incline_deg.get_target()
+            msg.pumptrack_enabled = 1 if self.runtime_pumptrack_enabled.get_target() else 0
+            msg.freewheel_enabled = 1 if self.runtime_freewheel_enabled.get_target() else 0
+            msg.pumptrack_period_min = self.runtime_pumptrack_period.get_target()
 
-        dprint(f"[PARAM APPLY PLACEHOLDER] index={param_index}, value={target}")
-        return True
+            with vesc_session_lock:
+                session.send_custom_no_reply(msg)
 
-    def read_all_parameters(self):
-        for idx, _name in PARAM_DEFS:
-            self.read_parameter(idx)
-        self.statusbar.showMessage("Read All executed")
+            self.statusbar.showMessage("Runtime parameters sent")
+        except Exception as e:
+            self.statusbar.showMessage(f"Set runtime failed: {type(e).__name__}: {e}")
 
-    def set_all_parameters(self):
-        ok_count = 0
-        for idx, _name in PARAM_DEFS:
-            if self.apply_parameter(idx):
-                ok_count += 1
-        self.statusbar.showMessage(f"Set All executed ({ok_count} parameters queued)")
+    def set_bike_params_clicked(self):
+        session = get_active_vesc_session()
+        if session is None:
+            self.statusbar.showMessage("No active VESC session")
+            return
 
-    def update_set_all_parameters(self):
-        with vesc_values_lock:
-            local_values = dict(vesc_values)
+        try:
+            msg = SetBikeSimParams()
+            msg.p_air_ro = self.bike_param_rows["p_air_ro"].get_target()
+            msg.p_c_rr = self.bike_param_rows["p_c_rr"].get_target()
+            msg.p_weight = self.bike_param_rows["p_weight"].get_target()
+            msg.p_As = self.bike_param_rows["p_As"].get_target()
+            msg.p_c_air = self.bike_param_rows["p_c_air"].get_target()
+            msg.p_c_bw = self.bike_param_rows["p_c_bw"].get_target()
+            msg.p_c_wl = self.bike_param_rows["p_c_wl"].get_target()
+            msg.p_wheel_radius = self.bike_param_rows["p_wheel_radius"].get_target()
+            msg.p_mech_gearing = self.bike_param_rows["p_mech_gearing"].get_target()
+            msg.p_r_bearings = self.bike_param_rows["p_r_bearings"].get_target()
+            msg.p_k_v_bw = self.bike_param_rows["p_k_v_bw"].get_target()
+            msg.p_J = self.bike_param_rows["p_J"].get_target()
+            msg.p_B = self.bike_param_rows["p_B"].get_target()
+            msg.p_k_area = self.bike_param_rows["p_k_area"].get_target()
+            msg.p_height = self.bike_param_rows["p_height"].get_target()
+            msg.p_speed_limit_pos_control_activation = self.bike_param_rows["p_speed_limit_pos_control_activation"].get_target()
 
-        current_idx = int(local_values.get("Param Index", -1))
-        current_value = float(local_values.get("Param Value", 0.0))
+            with vesc_session_lock:
+                session.send_custom_no_reply(msg)
 
-        if current_idx in self.param_boxes:
-            self.param_boxes[current_idx].edit_target.setText(f"{current_value:.6f}")
-            self.statusbar.showMessage(f"Updated set field for parameter {current_idx}")
-        else:
-            self.statusbar.showMessage("Update Set All: no matching live parameter index")
+            self.statusbar.showMessage("Bike parameters sent")
+        except Exception as e:
+            self.statusbar.showMessage(f"Set bike params failed: {type(e).__name__}: {e}")
+
+    def set_control_params_clicked(self):
+        session = get_active_vesc_session()
+        if session is None:
+            self.statusbar.showMessage("No active VESC session")
+            return
+
+        try:
+            msg = SetControlParams()
+            msg.p_fo_hz = self.control_param_rows["p_fo_hz"].get_target()
+            msg.p_gz_hz = self.control_param_rows["p_gz_hz"].get_target()
+            msg.p_fc_TLPF = self.control_param_rows["p_fc_TLPF"].get_target()
+            msg.p_adrc_scale = self.control_param_rows["p_adrc_scale"].get_target()
+            msg.p_sched_spd_floor = self.control_param_rows["p_sched_spd_floor"].get_target()
+            msg.p_sched_pos_floor = self.control_param_rows["p_sched_pos_floor"].get_target()
+            msg.p_sched_pos_dead_erpm = self.control_param_rows["p_sched_pos_dead_erpm"].get_target()
+            msg.p_sched_spd_sat_erpm = self.control_param_rows["p_sched_spd_sat_erpm"].get_target()
+            msg.p_sched_pos_sat_erpm = self.control_param_rows["p_sched_pos_sat_erpm"].get_target()
+
+            with vesc_session_lock:
+                session.send_custom_no_reply(msg)
+
+            self.statusbar.showMessage("Advanced parameters sent")
+        except Exception as e:
+            self.statusbar.showMessage(f"Set advanced params failed: {type(e).__name__}: {e}")
 
     def update_telemetry_table(self, values_dict):
         items = list(values_dict.items())
@@ -1298,6 +1527,7 @@ class Ui_MainWindow(object):
                 self.flag_start.set_state(False)
                 self.flag_index.set_state(False)
                 self.flag_enable.set_state(False)
+                self.apply_param_state_to_ui()
                 self.update_debug_view()
                 return
 
@@ -1312,16 +1542,9 @@ class Ui_MainWindow(object):
             self.flag_index.set_state(bool(local_values.get("INDEX_FOUND", 0)))
             self.flag_enable.set_state(bool(local_values.get("ENABLE", 0)))
 
-            try:
-                p_idx = int(local_values.get("Param Index", -1))
-                p_val = float(local_values.get("Param Value", 0.0))
-                if p_idx in self.param_boxes:
-                    self.param_boxes[p_idx].edit_actual.setText(f"{p_val:.6f}")
-            except Exception:
-                pass
-
             self.update_telemetry_table(local_values)
             self.refresh_plots()
+            self.apply_param_state_to_ui()
             self.update_debug_view()
 
         except Exception:
@@ -1410,6 +1633,8 @@ class Ui_MainWindow(object):
             ("T_friction", self.curve_tf, "curve_tf"),
             ("Pedal Torque Observed", self.curve_tp_obs, "curve_tp_obs"),
             ("T_F_combine", self.curve_tf_combine, "curve_tf_combine"),
+            ("Torque Motor", self.curve_torque_motor, "curve_torque_motor"),
+            ("Torque FF", self.curve_torque_ff, "curve_torque_ff"),
             ("Speed Error", self.curve_speed_error, "curve_speed_error"),
             ("Pos Term Speed", self.curve_pos_term_speed, "curve_pos_term_speed"),
         ]:
@@ -1460,6 +1685,8 @@ class Ui_MainWindow(object):
                 ("T_friction", self.popup_window.curve_popup_tf, "curve_popup_tf"),
                 ("Pedal Torque Observed", self.popup_window.curve_popup_tp_obs, "curve_popup_tp_obs"),
                 ("T_F_combine", self.popup_window.curve_popup_tf_combine, "curve_popup_tf_combine"),
+                ("Torque Motor", self.popup_window.curve_popup_torque_motor, "curve_popup_torque_motor"),
+                ("Torque FF", self.popup_window.curve_popup_torque_ff, "curve_popup_torque_ff"),
                 ("Speed Error", self.popup_window.curve_popup_speed_error, "curve_popup_speed_error"),
                 ("Pos Term Speed", self.popup_window.curve_popup_pos_term_speed, "curve_popup_pos_term_speed"),
                 ("Setpoint Speed km/h", self.popup_window.curve_popup_model_speed, "curve_popup_model_speed"),
@@ -1529,7 +1756,7 @@ def send_command(vesc, mode, value):
 # Threads
 # =========================
 def vesc_communication():
-    global vesc_values, selected_port, control_value, control_mode
+    global vesc_values, selected_port, control_value, control_mode, vesc_session
 
     log_event("Comm thread started")
 
@@ -1554,6 +1781,9 @@ def vesc_communication():
             debug_list_ports()
 
             with VESC(serial_port=port, start_heartbeat=False, baudrate=1200, timeout=0.25) as vesc:
+                with vesc_session_lock:
+                    vesc_session = vesc
+
                 set_diag(serial_open=True)
                 log_event(f"Serial open OK on {port} (session {session_id})")
 
@@ -1563,6 +1793,21 @@ def vesc_communication():
                     log_event("Initial RX/TX buffer reset after open")
                 except Exception as e:
                     log_event(f"Initial recovery after open failed: {type(e).__name__}: {e}")
+
+                next_param_refresh_time = 0.0
+
+                try:
+                    with param_state_lock:
+                        need_initial = bool(param_state["pending_initial_refresh"])
+                        param_state["pending_initial_refresh"] = False
+
+                    if need_initial:
+                        with vesc_session_lock:
+                            read_param_blocks_from_session(vesc, update_targets=True)
+                        next_param_refresh_time = time.perf_counter() + PARAM_REFRESH_PERIOD_S
+                        log_event("Initial parameter refresh done")
+                except Exception as e:
+                    log_event(f"Initial parameter refresh failed: {type(e).__name__}: {e}")
 
                 consecutive_timeouts = 0
                 last_cmd_sent = None
@@ -1587,7 +1832,6 @@ def vesc_communication():
                     cycle_start = time.perf_counter()
 
                     try:
-                        log_event("TX: telemetry request")
                         response = vesc.get_measurements_exp()
 
                         new_values = build_vesc_values(response)
@@ -1659,7 +1903,6 @@ def vesc_communication():
                         if should_send:
                             try:
                                 time.sleep(TX_GUARD_S * 2.0)
-                                log_event(f"TX: command mode={cmd_now[0]} value={cmd_now[1]:.3f}")
                                 send_command(vesc, cmd_now[0], cmd_now[1])
                                 time.sleep(TX_GUARD_S * 2.0)
 
@@ -1688,6 +1931,15 @@ def vesc_communication():
 
                         time.sleep(TX_GUARD_S)
 
+                    try:
+                        now_after = time.perf_counter()
+                        if now_after >= next_param_refresh_time:
+                            read_param_blocks_from_session(vesc, update_targets=False)
+                            next_param_refresh_time = now_after + PARAM_REFRESH_PERIOD_S
+                    except Exception as e:
+                        log_event(f"Periodic parameter refresh failed: {type(e).__name__}: {e}")
+                        next_param_refresh_time = time.perf_counter() + PARAM_REFRESH_PERIOD_S
+
                     next_telem_time = cycle_start + TELEMETRY_PERIOD_S
 
         except Exception:
@@ -1701,6 +1953,8 @@ def vesc_communication():
             time.sleep(REOPEN_BACKOFF_S)
 
         finally:
+            with vesc_session_lock:
+                vesc_session = None
             set_diag(serial_open=False)
 
 
