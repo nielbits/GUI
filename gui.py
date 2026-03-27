@@ -182,16 +182,62 @@ param_state = {
 # =========================
 # Telemetry helpers
 # =========================
-def estimate_real_speed_kmh(erpm, gear_ratio):
+def get_speed_conversion_params():
+    """
+    Read the current wheel radius and mechanical gearing from the parameter block.
+    Fall back to the previous constants if the params are not available yet.
+    """
+    with param_state_lock:
+        bike = dict(param_state.get("bike", {}))
+
+    wheel_radius = float(bike.get("p_wheel_radius", WHEEL_RADIUS_M))
+    mech_gearing = float(bike.get("p_mech_gearing", GM))
+
+    if abs(wheel_radius) < 1e-9:
+        wheel_radius = WHEEL_RADIUS_M
+    if abs(mech_gearing) < 1e-9:
+        mech_gearing = GM
+
+    return wheel_radius, mech_gearing
+
+
+def estimate_speed_kmh_from_motor_mech_radps(motor_mech_radps, gear_ratio):
+    """
+    Convert motor mechanical speed [rad/s] to vehicle speed [km/h] using:
+        speed_mps = motor_mech_radps * wheel_radius / gearing
+        gearing   = mech_gearing / gear_ratio
+    """
     try:
         gear_ratio = float(gear_ratio)
         if abs(gear_ratio) < 1e-9:
             return 0.0
 
-        gearing = GM / gear_ratio
-        motor_mech_radps = (float(erpm) / POLE_PAIRS) * (2.0 * math.pi / 60.0)
-        speed_mps = motor_mech_radps * WHEEL_RADIUS_M / gearing
+        wheel_radius, mech_gearing = get_speed_conversion_params()
+        gearing = mech_gearing / gear_ratio
+
+        if abs(gearing) < 1e-9:
+            return 0.0
+
+        speed_mps = float(motor_mech_radps) * wheel_radius / gearing
         return speed_mps * 3.6
+    except Exception:
+        return 0.0
+
+
+def estimate_real_speed_kmh(erpm, gear_ratio):
+    try:
+        motor_mech_radps = (float(erpm) / POLE_PAIRS) * (2.0 * math.pi / 60.0)
+        return estimate_speed_kmh_from_motor_mech_radps(motor_mech_radps, gear_ratio)
+    except Exception:
+        return 0.0
+
+
+def estimate_setpoint_speed_kmh(model_speed, gear_ratio):
+    """
+    model_speed is assumed to be motor mechanical speed [rad/s].
+    """
+    try:
+        return estimate_speed_kmh_from_motor_mech_radps(float(model_speed), gear_ratio)
     except Exception:
         return 0.0
 
@@ -213,12 +259,11 @@ def build_vesc_values(response):
     position_error_rad = uw_angle_sp - uw_theta
     position_error_deg = math.degrees(position_error_rad) / GM
     real_speed_kmh = estimate_real_speed_kmh(rpm_erpm, gear_ratio)
+    setpoint_speed_kmh = estimate_setpoint_speed_kmh(model_speed, gear_ratio)
 
     rpm_motor = rpm_erpm / POLE_PAIRS
     rpm_set = erpm_soll / POLE_PAIRS
     leso_rpm = float(getattr(response, "leso_omega", 0.0)) / POLE_PAIRS
-
-    setpoint_speed_kmh = model_speed * gear_ratio
 
     return {
         "RPM Motor": rpm_motor,
