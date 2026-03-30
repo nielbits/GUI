@@ -6,24 +6,183 @@ import math
 import threading
 import traceback
 import collections
+import types
 import serial
 import serial.tools.list_ports
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
-from pyvesc.VESC.VESC import VESC
 
-from pyvesc.VESC.messages.getters import (
-    GetValuesExp,
-    GetBikeRuntime,
-    GetBikeSimParams,
-    GetControlParams
-)
-from pyvesc.VESC.messages.setters import (
-    SetBikeRuntime,
-    SetBikeSimParams,
-    SetControlParams
-)
+from pyvesc.VESC.VESC import VESC
+from pyvesc.protocol.base import VESCMessage
+from pyvesc.protocol.interface import encode, encode_request, decode
+from pyvesc.VESC.messages import VedderCmd
+
+
+# ============================================================
+# Local custom VESC messages
+# These let you keep pyvesc getters.py / setters.py original
+# ============================================================
+
+class GetValuesExp(metaclass=VESCMessage):
+    id = 157
+
+    fields = [
+        # Base telemetry
+        ('temp_fet', 'h', 10),
+        ('temp_motor', 'h', 10),
+        ('avg_motor_current', 'i', 100),
+        ('avg_input_current', 'i', 100),
+        ('avg_id', 'i', 100),
+        ('avg_iq', 'i', 100),
+        ('duty_cycle_now', 'h', 1000),
+        ('rpm', 'i', 1),
+        ('v_in', 'h', 10),
+        ('amp_hours', 'i', 10000),
+        ('amp_hours_charged', 'i', 10000),
+        ('watt_hours', 'i', 10000),
+        ('watt_hours_charged', 'i', 10000),
+        ('tachometer', 'i', 1),
+        ('tachometer_abs', 'i', 1),
+        ('mc_fault_code', 'c', 0),
+        ('pid_pos_now', 'i', 1000000),
+        ('app_controller_id', 'c', 0),
+        ('temp_mos1', 'h', 10),
+        ('temp_mos2', 'h', 10),
+        ('temp_mos3', 'h', 10),
+        ('avg_vd', 'i', 1000),
+        ('avg_vq', 'i', 1000),
+        ('status', 'c', 0),
+
+        # Extended telemetry
+        ('erpm_soll', 'h', 1),
+        ('tf', 'h', 10000),
+        ('gear_ratio', 'i', 100),
+        ('id_current', 'i', 100),
+        ('iq_current', 'i', 100),
+        ('model_speed', 'h', 100),
+        ('f_combine', 'h', 10),
+        ('iq_set', 'i', 10000),
+        ('uw_theta', 'i', 10000),
+        ('leso_omega', 'i', 10000),
+        ('tp_observed', 'i', 10000),
+        ('param_index', 'i', 1),
+        ('i_res', 'i', 1000000),
+        ('uw_angle_sp', 'i', 10000),
+        ('param_from_index', 'i', 1000),
+        ('pos_term_speed', 'i', 1000),
+        ('speed_error', 'i', 1000),
+        ('t_f_combine', 'i', 1000),
+        ('incline_deg_ist', 'i', 1000),
+        ('torque_motor', 'i', 1000),
+        ('torque_ff', 'i', 1000),
+        ('test_7_007', 'i', 1000),
+        ('test_8_008', 'i', 1000),
+        ('test_9_009', 'i', 1000),
+        ('status_bits_ext', 'I', 1),
+    ]
+
+
+class GetBikeRuntime(metaclass=VESCMessage):
+    id = 159
+
+    fields = [
+        ('gear_ratio_bike', 'i', 1000000),
+        ('incline_deg', 'i', 1000),
+        ('pumptrack_enabled', 'B', 1),
+        ('freewheel_enabled', 'B', 1),
+        ('pumptrack_period_min', 'i', 1000),
+    ]
+
+
+class GetBikeSimParams(metaclass=VESCMessage):
+    id = 161
+
+    fields = [
+        ('p_air_ro', 'i', 1000000),
+        ('p_c_rr', 'i', 1000000),
+        ('p_weight', 'i', 1000),
+        ('p_As', 'i', 1000000),
+        ('p_c_air', 'i', 1000000),
+        ('p_c_bw', 'i', 1000000),
+        ('p_c_wl', 'i', 1000000),
+        ('p_wheel_radius', 'i', 1000000),
+        ('p_mech_gearing', 'i', 1000000),
+        ('p_r_bearings', 'i', 1000000),
+        ('p_k_v_bw', 'i', 1000000),
+        ('p_J', 'i', 1000000),
+        ('p_B', 'i', 1000000),
+        ('p_k_area', 'i', 1000000),
+        ('p_height', 'i', 1000000),
+        ('p_speed_limit_pos_control_activation', 'i', 1000000),
+    ]
+
+
+class GetControlParams(metaclass=VESCMessage):
+    id = 163
+
+    fields = [
+        ('p_fo_hz',               'i', 1000000),
+        ('p_gz_hz',               'i', 1000000),
+        ('p_fc_TLPF',             'i', 1000000),
+        ('p_adrc_scale',          'i', 1000000),
+        ('p_sched_spd_floor',     'i', 1000000),
+        ('p_sched_pos_floor',     'i', 1000000),
+        ('p_sched_pos_dead_erpm', 'i', 1000000),
+        ('p_sched_spd_sat_erpm',  'i', 1000000),
+        ('p_sched_pos_sat_erpm',  'i', 1000000),
+    ]
+
+
+class SetBikeRuntime(metaclass=VESCMessage):
+    id = 158
+
+    fields = [
+        ('gear_ratio_bike', 'i', 1000000),
+        ('incline_deg', 'i', 1000),
+        ('pumptrack_enabled', 'B', 1),
+        ('freewheel_enabled', 'B', 1),
+        ('pumptrack_period_min', 'i', 1000),
+    ]
+
+
+class SetBikeSimParams(metaclass=VESCMessage):
+    id = 160
+
+    fields = [
+        ('p_air_ro', 'i', 1000000),
+        ('p_c_rr', 'i', 1000000),
+        ('p_weight', 'i', 1000),
+        ('p_As', 'i', 1000000),
+        ('p_c_air', 'i', 1000000),
+        ('p_c_bw', 'i', 1000000),
+        ('p_c_wl', 'i', 1000000),
+        ('p_wheel_radius', 'i', 1000000),
+        ('p_mech_gearing', 'i', 1000000),
+        ('p_r_bearings', 'i', 1000000),
+        ('p_k_v_bw', 'i', 1000000),
+        ('p_J', 'i', 1000000),
+        ('p_B', 'i', 1000000),
+        ('p_k_area', 'i', 1000000),
+        ('p_height', 'i', 1000000),
+        ('p_speed_limit_pos_control_activation', 'i', 1000000),
+    ]
+
+
+class SetControlParams(metaclass=VESCMessage):
+    id = 162
+
+    fields = [
+        ('p_fo_hz',               'i', 1000000),
+        ('p_gz_hz',               'i', 1000000),
+        ('p_fc_TLPF',             'i', 1000000),
+        ('p_adrc_scale',          'i', 1000000),
+        ('p_sched_spd_floor',     'i', 1000000),
+        ('p_sched_pos_floor',     'i', 1000000),
+        ('p_sched_pos_dead_erpm', 'i', 1000000),
+        ('p_sched_spd_sat_erpm',  'i', 1000000),
+        ('p_sched_pos_sat_erpm',  'i', 1000000),
+    ]
 
 
 # =========================
@@ -31,7 +190,6 @@ from pyvesc.VESC.messages.setters import (
 # =========================
 DEBUG = False
 
-# Parameter actual-value polling period
 PARAM_REFRESH_PERIOD_S = 2.0
 
 
@@ -40,7 +198,7 @@ def dprint(*args, **kwargs):
         print(*args, **kwargs)
 
 
-vesc_com_flag = threading.Event()   # user wants communication
+vesc_com_flag = threading.Event()
 prog_flag = threading.Event()
 
 vesc_values = {}
@@ -180,13 +338,110 @@ param_state = {
 
 
 # =========================
+# VESC compatibility helpers
+# Make original VESC.py behave like your modified one
+# =========================
+def attach_custom_io(vesc):
+    if getattr(vesc, "_gui_custom_io_attached", False):
+        return
+
+    serial_lock = threading.RLock()
+    timeout_s = float(getattr(getattr(vesc, "serial_port", None), "timeout", 0.25) or 0.25)
+
+    def recover_from_timeout(self):
+        try:
+            with serial_lock:
+                try:
+                    self.serial_port.reset_input_buffer()
+                except Exception:
+                    pass
+                try:
+                    self.serial_port.reset_output_buffer()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def request_custom(self, msg):
+        frame = encode_request(msg)
+        with serial_lock:
+            try:
+                try:
+                    self.serial_port.reset_input_buffer()
+                except Exception:
+                    pass
+
+                self.serial_port.write(frame)
+
+                deadline = time.perf_counter() + timeout_s
+                raw = bytearray()
+
+                while True:
+                    waiting = self.serial_port.in_waiting
+                    if waiting > 0:
+                        chunk = self.serial_port.read(waiting)
+                        if chunk:
+                            raw.extend(chunk)
+                            try:
+                                response, consumed = decode(bytes(raw))
+                                if consumed > 0 and response is not None:
+                                    return response
+                            except Exception:
+                                # keep collecting until timeout
+                                pass
+
+                    if time.perf_counter() >= deadline:
+                        try:
+                            self.serial_port.reset_input_buffer()
+                        except Exception:
+                            pass
+                        raise TimeoutError(f"Timed out waiting for custom reply, buffered_len={len(raw)}")
+
+                    time.sleep(0.001)
+
+            except OSError as e:
+                raise OSError(f"Serial custom request failed: {e}") from e
+
+    def send_custom_no_reply(self, msg):
+        frame = encode(msg)
+        with serial_lock:
+            try:
+                written = self.serial_port.write(frame)
+                try:
+                    self.serial_port.flush()
+                except Exception:
+                    pass
+                return written
+            except OSError as e:
+                raise OSError(f"Serial custom write failed: {e}") from e
+
+    vesc.recover_from_timeout = types.MethodType(recover_from_timeout, vesc)
+    vesc.request_custom = types.MethodType(request_custom, vesc)
+    vesc.send_custom_no_reply = types.MethodType(send_custom_no_reply, vesc)
+
+    vesc._gui_custom_io_attached = True
+
+
+def get_measurements_exp(vesc):
+    return vesc.request_custom(GetValuesExp())
+
+
+def get_bike_runtime(vesc):
+    return vesc.request_custom(GetBikeRuntime())
+
+
+def get_bike_sim_params(vesc):
+    return vesc.request_custom(GetBikeSimParams())
+
+
+def get_control_params(vesc):
+    return vesc.request_custom(GetControlParams())
+
+
+# =========================
 # Telemetry helpers
 # =========================
 def get_speed_conversion_params():
-    """
-    Read the current wheel radius and mechanical gearing from the parameter block.
-    Fall back to the previous constants if the params are not available yet.
-    """
     with param_state_lock:
         bike = dict(param_state.get("bike", {}))
 
@@ -202,11 +457,6 @@ def get_speed_conversion_params():
 
 
 def estimate_speed_kmh_from_motor_mech_radps(motor_mech_radps, gear_ratio):
-    """
-    Convert motor mechanical speed [rad/s] to vehicle speed [km/h] using:
-        speed_mps = motor_mech_radps * wheel_radius / gearing
-        gearing   = mech_gearing / gear_ratio
-    """
     try:
         gear_ratio = float(gear_ratio)
         if abs(gear_ratio) < 1e-9:
@@ -233,9 +483,6 @@ def estimate_real_speed_kmh(erpm, gear_ratio):
 
 
 def estimate_setpoint_speed_kmh(model_speed, gear_ratio):
-    """
-    model_speed is assumed to be motor mechanical speed [rad/s].
-    """
     try:
         return estimate_speed_kmh_from_motor_mech_radps(float(model_speed), gear_ratio)
     except Exception:
@@ -364,10 +611,11 @@ def get_active_vesc_session():
     with vesc_session_lock:
         return vesc_session
 
+
 def read_param_blocks_from_session(vesc, update_targets=False):
-    runtime = vesc.get_bike_runtime()
-    bike = vesc.get_bike_sim_params()
-    control = vesc.get_control_params()
+    runtime = get_bike_runtime(vesc)
+    bike = get_bike_sim_params(vesc)
+    control = get_control_params(vesc)
 
     with param_state_lock:
         param_state["runtime"] = {
@@ -408,6 +656,7 @@ def read_param_blocks_from_session(vesc, update_targets=False):
         }
         param_state["ui_sync_needed"] = True
         param_state["ui_sync_update_targets"] = bool(update_targets)
+
 
 # =========================
 # Small UI helpers
@@ -631,7 +880,7 @@ class PopupChartsWindow(QtWidgets.QMainWindow):
         self.btn_popup_mouse.clicked.connect(
             lambda: self.parent_ui.toggle_plot_mouse(self.popup_plots, self.btn_popup_mouse)
         )
-        
+
     def zoom_fit_popup(self):
         self.popup_scroll_mode = False
         self.parent_ui.autorange_plots(self.popup_plots)
@@ -1074,7 +1323,7 @@ class Ui_MainWindow(object):
         adv_grid.setContentsMargins(4, 4, 4, 4)
         adv_grid.setHorizontalSpacing(8)
         adv_grid.setVerticalSpacing(4)
-        
+
         self.control_param_rows = {
             "p_fo_hz": ParamEditRow("p_fo_hz"),
             "p_gz_hz": ParamEditRow("p_gz_hz"),
@@ -1825,7 +2074,9 @@ def vesc_communication():
             log_event(f"Opening VESC on {port} (session {session_id})")
             debug_list_ports()
 
-            with VESC(serial_port=port, start_heartbeat=False, baudrate=1200, timeout=0.25) as vesc:
+            with VESC(serial_port=port, start_heartbeat=False, baudrate=115200, timeout=0.25) as vesc:
+                attach_custom_io(vesc)
+
                 with vesc_session_lock:
                     vesc_session = vesc
 
@@ -1877,7 +2128,7 @@ def vesc_communication():
                     cycle_start = time.perf_counter()
 
                     try:
-                        response = vesc.get_measurements_exp()
+                        response = get_measurements_exp(vesc)
 
                         new_values = build_vesc_values(response)
 
