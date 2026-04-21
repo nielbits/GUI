@@ -23,9 +23,12 @@ from pyvesc.VESC.messages import VedderCmd
 # Local custom VESC messages
 # These let you keep pyvesc getters.py / setters.py original
 # ============================================================
-
+class StartBikeSim(metaclass=VESCMessage):
+    id = 167
+    fields = []
+    
 class GetValuesExp(metaclass=VESCMessage):
-    id = 157
+    id = 164
 
     fields = [
         # Base telemetry
@@ -84,7 +87,7 @@ class GetValuesExp(metaclass=VESCMessage):
 
 
 class GetBikeRuntime(metaclass=VESCMessage):
-    id = 159
+    id = 166
 
     fields = [
         ('gear_ratio_bike', 'i', 1000000),
@@ -135,7 +138,7 @@ class GetControlParams(metaclass=VESCMessage):
 
 
 class SetBikeRuntime(metaclass=VESCMessage):
-    id = 158
+    id = 165
 
     fields = [
         ('gear_ratio_bike', 'i', 1000000),
@@ -192,6 +195,9 @@ DEBUG = False
 
 PARAM_REFRESH_PERIOD_S = 2.0
 
+def start_bike_sim(vesc):
+    vesc.send_custom_no_reply(StartBikeSim())
+    log_event("COMM_START_BIKE_SIM sent")
 
 def dprint(*args, **kwargs):
     if DEBUG:
@@ -336,6 +342,22 @@ param_state = {
     "ui_sync_update_targets": False,
 }
 
+custom_msg_test_lock = threading.Lock()
+custom_msg_test_results = collections.deque(maxlen=100)
+
+def add_custom_msg_result(name, ok, detail):
+    with custom_msg_test_lock:
+        custom_msg_test_results.appendleft({
+            "t": time.strftime("%H:%M:%S"),
+            "name": name,
+            "ok": bool(ok),
+            "detail": str(detail),
+        })
+
+def get_custom_msg_results():
+    with custom_msg_test_lock:
+        return list(custom_msg_test_results)
+
 
 # =========================
 # VESC compatibility helpers
@@ -437,7 +459,35 @@ def get_bike_sim_params(vesc):
 def get_control_params(vesc):
     return vesc.request_custom(GetControlParams())
 
+def probe_custom_message(vesc, name, fn):
+    try:
+        res = fn()
+        detail = response_summary(res) if hasattr(res, "__dict__") else str(res)
+        add_custom_msg_result(name, True, detail)
+        log_event(f"{name}: OK -> {detail}")
+        return res
+    except Exception as e:
+        detail = f"{type(e).__name__}: {e}"
+        add_custom_msg_result(name, False, detail)
+        log_event(f"{name}: FAIL -> {detail}")
+        return None
+def run_custom_message_selftest(vesc):
+    log_event("Running custom message self-test...")
 
+    probe_custom_message(vesc, "COMM_GET_BIKE_RUNTIME", lambda: get_bike_runtime(vesc))
+    time.sleep(0.05)
+
+    probe_custom_message(vesc, "COMM_GET_BIKE_SIM_PARAMS", lambda: get_bike_sim_params(vesc))
+    time.sleep(0.05)
+
+    probe_custom_message(vesc, "COMM_GET_CONTROL_PARAMS", lambda: get_control_params(vesc))
+    time.sleep(0.05)
+
+    probe_custom_message(vesc, "COMM_GET_VALUES_EXP", lambda: get_measurements_exp(vesc))
+    time.sleep(0.05)
+
+    probe_custom_message(vesc, "COMM_START_BIKE_SIM", lambda: start_bike_sim(vesc) or "sent_no_reply")
+    log_event("Custom message self-test finished")
 # =========================
 # Telemetry helpers
 # =========================
@@ -555,7 +605,7 @@ def build_vesc_values(response):
     }
 
 
-def response_summary(response):
+"""def response_summary(response):
     try:
         rpm = getattr(response, "rpm", None)
         v_in = getattr(response, "v_in", None)
@@ -568,7 +618,22 @@ def response_summary(response):
         )
     except Exception:
         return "<unavailable>"
+"""
+def response_summary(response):
+    try:
+        if response is None:
+            return "<none>"
 
+        if hasattr(response, "__dict__"):
+            items = []
+            for k, v in response.__dict__.items():
+                if not k.startswith("_"):
+                    items.append(f"{k}={v}")
+            return ", ".join(items[:12])
+
+        return str(response)
+    except Exception:
+        return "<unavailable>"
 
 def append_history(values_dict):
     global sample_counter
@@ -1724,6 +1789,11 @@ class Ui_MainWindow(object):
             "=== Recent events ===",
         ]
         lines.extend(d.get("event_log", []))
+        lines.append("")
+        lines.append("=== Custom message tests ===")
+        for item in get_custom_msg_results():
+            state = "OK" if item["ok"] else "FAIL"
+            lines.append(f"[{item['t']}] {item['name']} -> {state} -> {item['detail']}")
         self.debugText.setPlainText("\n".join(lines))
 
     def autorange_plots(self, plots):
@@ -2028,10 +2098,9 @@ def command_changed(prev_cmd, new_cmd):
     elif new_mode == "Position":
         return abs(new_val - prev_val) >= SERVO_EPS
     elif new_mode == "Speed":
-        return abs(new_val - prev_val) >= SPEED_EPS
+        return False
     else:
         return abs(new_val - prev_val) >= CURRENT_EPS
-
 
 def send_command(vesc, mode, value):
     if mode == "Duty Cycle":
@@ -2041,7 +2110,7 @@ def send_command(vesc, mode, value):
     elif mode == "Position":
         vesc.set_servo(value)
     elif mode == "Speed":
-        vesc.set_rpm(1000)
+        start_bike_sim(vesc)
     else:
         vesc.set_current(0.0)
 
@@ -2082,7 +2151,35 @@ def vesc_communication():
 
                 set_diag(serial_open=True)
                 log_event(f"Serial open OK on {port} (session {session_id})")
-
+                #try:
+                 #   fw = vesc.get_firmware_version()
+                 #   log_event(f"FW version response: {fw}")
+                #except Exception as e:
+                 #   log_event(f"FW version read failed: {type(e).__name__}: {e}")
+                try:
+                    runtime = get_bike_runtime(vesc)
+                    log_event(
+                        "COMM_GET_BIKE_RUNTIME OK: "
+                        f"gear_ratio_bike={runtime.gear_ratio_bike}, "
+                        f"incline_deg={runtime.incline_deg}, "
+                        f"pumptrack_enabled={runtime.pumptrack_enabled}, "
+                        f"freewheel_enabled={runtime.freewheel_enabled}, "
+                        f"pumptrack_period_min={runtime.pumptrack_period_min}"
+                    )
+                except Exception as e:
+                    log_event(f"COMM_GET_BIKE_RUNTIME FAIL: {type(e).__name__}: {e}")
+               
+                 
+                try:
+                    vals = vesc.get_measurements()
+                    log_event(f"Stock values OK: rpm={getattr(vals, 'rpm', 'n/a')}, vin={getattr(vals, 'v_in', 'n/a')}")
+                except Exception as e:
+                    log_event(f"Stock values failed: {type(e).__name__}: {e}")
+                    
+                try:
+                    run_custom_message_selftest(vesc)
+                except Exception as e:
+                    log_event(f"Custom self-test crashed: {type(e).__name__}: {e}")
                 time.sleep(0.2)
                 try:
                     vesc.recover_from_timeout()
@@ -2196,7 +2293,7 @@ def vesc_communication():
                         elif (time.perf_counter() - last_command_tx_time) >= COMMAND_KEEPALIVE_S:
                             should_send = True
 
-                        if should_send:
+                        if should_send or (cmd_now[0] == "Speed" and last_cmd_sent is None):
                             try:
                                 time.sleep(TX_GUARD_S * 2.0)
                                 send_command(vesc, cmd_now[0], cmd_now[1])
