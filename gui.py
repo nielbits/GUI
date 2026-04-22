@@ -210,8 +210,8 @@ class BleUartTransport:
     custom request/reply helpers.
     """
 
-    def __init__(self, address, timeout=0.25):
-        self.address = address
+    def __init__(self, device, timeout=0.25):
+        self.device = device
         self.timeout = timeout
         self._loop = None
         self._thread = None
@@ -226,10 +226,28 @@ class BleUartTransport:
             self._rx_buf.extend(data)
             self._rx_cv.notify_all()
 
+    def _on_disconnect(client):
+        print("BLE DISCONNECTED")
+
     async def _async_connect(self):
-        self._client = BleakClient(self.address)
+        self._client = BleakClient(self.device, disconnected_callback=self._on_disconnect)
         await self._client.connect()
-        await self._client.start_notify(BLE_TX_UUID, self._notification_handler)
+        print("CONNECTED:", self._client.is_connected)
+
+        services = self._client.services
+        tx_char = None
+        for s in services:
+            print("SERVICE", s.uuid)
+            for c in s.characteristics:
+                print("  CHAR", c.uuid, c.properties)
+                if c.uuid.lower() == BLE_TX_UUID.lower():
+                    tx_char = c
+
+        if tx_char is None:
+            raise RuntimeError(f"TX characteristic not found: {BLE_TX_UUID}")
+
+        await asyncio.sleep(0.5)
+        await self._client.start_notify(tx_char, self._notification_handler)
         self._connected = True
 
     async def _async_disconnect(self):
@@ -329,20 +347,7 @@ class BleUartTransport:
 
 def scan_ble_devices_blocking():
     async def _scan():
-        devices = await BleakScanner.discover(timeout=BLE_SCAN_TIMEOUT_S)
-        matches = []
-        for d in devices:
-            name = d.name or "<unknown>"
-            metadata = getattr(d, "metadata", {}) or {}
-            uuids = [u.lower() for u in (metadata.get("uuids", []) or [])]
-
-            if (
-                BLE_SERVICE_UUID.lower() in uuids
-                or BLE_DEVICE_NAME_HINT.lower() in name.lower()
-            ):
-                matches.append((name, d.address))
-
-        return matches
+        return await BleakScanner.discover(timeout=8.0)
 
     loop = asyncio.new_event_loop()
     try:
@@ -359,7 +364,7 @@ def scan_ble_devices_blocking():
 # =========================
 # Global state
 # =========================
-DEBUG = False
+DEBUG = True
 PARAM_REFRESH_PERIOD_S = 2.0
 vesc_com_flag = threading.Event()
 prog_flag = threading.Event()
@@ -1082,17 +1087,17 @@ class Ui_MainWindow(object):
 
         if not devices:
             self.comboBox_portselect.addItem("No BLE devices found", None)
-            log_event("BLE scan: no matching device found")
+            log_event("BLE scan: no BLE devices found")
             self.statusbar.showMessage("No BLE devices found")
             return
 
-        for name, address in devices:
-            display_text = f"{name} - {address}"
-            self.comboBox_portselect.addItem(display_text, address)
+        for dev in devices:
+            name = dev.name or "<no name>"
+            display_text = f"{name} - {dev.address}"
+            self.comboBox_portselect.addItem(display_text, dev)
 
-        log_event(f"BLE scan: found {len(devices)} matching device(s)")
+        log_event(f"BLE scan: found {len(devices)} BLE device(s)")
         self.statusbar.showMessage(f"Found {len(devices)} BLE device(s)")
-
 
     def on_ble_scan_failed(self, err):
         self.comboBox_portselect.clear()
@@ -1487,16 +1492,18 @@ class Ui_MainWindow(object):
     def start_com(self):
         global selected_port
         idx = self.comboBox_portselect.currentIndex()
-        selected_port = self.comboBox_portselect.itemData(idx)
-        if selected_port:
+        selected_port = self.comboBox_portselect.itemData(idx)   # this is now a BLEDevice
+
+        if selected_port is not None:
             with param_state_lock:
                 param_state["pending_initial_refresh"] = True
                 param_state["ui_sync_needed"] = False
                 param_state["ui_sync_update_targets"] = False
-            set_diag(selected_port=selected_port)
-            log_event(f"Connect requested on {selected_port}")
+
+            set_diag(selected_port=selected_port.address)
+            log_event(f"Connect requested on {selected_port.address} ({selected_port.name})")
             vesc_com_flag.set()
-            self.statusbar.showMessage(f"Connect requested to {selected_port}")
+            self.statusbar.showMessage(f"Connect requested to {selected_port.address}")
         else:
             self.statusbar.showMessage("No valid BLE device selected")
             log_event("Connect requested but no valid BLE device selected")
@@ -1986,15 +1993,15 @@ def vesc_communication():
         session_id = int(time.time() * 1000) % 100000000
         set_diag(serial_session_id=session_id, selected_port=port)
         try:
-            log_event(f"Opening BLE VESC bridge on {port} (session {session_id})")
-            with BleUartTransport(address=port, timeout=0.25) as ble_port:
+            log_event(f"Opening BLE VESC bridge on {port.address} (session {session_id})")
+            with BleUartTransport(device=port, timeout=0.25) as ble_port:
                 # This assumes your pyvesc VESC class accepts a serial-like object.
                 vesc = VESC(serial_port=ble_port, start_heartbeat=False, baudrate=115200, timeout=0.25)
                 attach_custom_io(vesc)
                 with vesc_session_lock:
                     vesc_session = vesc
                 set_diag(serial_open=True)
-                log_event(f"BLE link open OK on {port} (session {session_id})")
+                log_event(f"BLE link open OK on {port.address} (session {session_id})")
                 try:
                     runtime = get_bike_runtime(vesc)
                     log_event(
