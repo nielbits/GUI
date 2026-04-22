@@ -3,3 +3,4 @@
 /import socket.py
 /test_nanolog_tcp.py
 /venv
+/.venv

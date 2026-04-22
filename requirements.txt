@@ -1,10 +1,15 @@
+bleak==3.0.1
+colorama==0.4.6
 crccheck==1.3.1
+dbus-fast==4.0.4
 future==1.0.0
 importlib_metadata==8.7.0
 iso8601==2.1.0
+numpy==2.4.3
 PyQt5==5.15.11
 PyQt5-Qt5==5.15.18
 PyQt5_sip==12.17.1
+pyqtgraph==0.14.0
 pyserial==3.5
 pythoncrc==1.21
 pyvesc @ git+https://github.com/LiamBindle/PyVESC.git@d2f2076afe91dafa920a38a437528819697e05e3
