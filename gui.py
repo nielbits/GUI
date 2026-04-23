@@ -180,12 +180,18 @@ class SetControlParams(metaclass=VESCMessage):
 # =========================
 # BLE UART config
 # =========================
+# =========================
+# BLE UART config
+# =========================
 BLE_DEVICE_NAME_HINT = "VESC_ISOLATED_TEST"
 BLE_SERVICE_UUID = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
 BLE_RX_UUID = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"  # write here
 BLE_TX_UUID = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"  # notifications from here
-BLE_SCAN_TIMEOUT_S = 4.0
-BLE_WRITE_CHUNK = 180
+BLE_SCAN_TIMEOUT_S = 8.0
+BLE_CONNECT_TIMEOUT_S = 10.0
+BLE_WRITE_CHUNK = 20  # VESC Tool uses 20-byte chunks on BLE UART
+BLE_ADDRESS = "8C:BF:EA:B3:51:42"  # default / fallback only
+
 
 class BleScanWorker(QtCore.QObject):
     finished = QtCore.pyqtSignal(list)
@@ -203,11 +209,16 @@ class BleScanWorker(QtCore.QObject):
         except Exception as e:
             self.failed.emit(f"{type(e).__name__}: {e}")
 
+
 class BleUartTransport:
     """
     Serial-like transport implemented on top of BLE Nordic UART Service.
-    It exposes the subset of the pyserial API used by VESC.py and by your
-    custom request/reply helpers.
+    Mirrors the relevant VESC Tool BLE UART behavior:
+      - connect to selected device
+      - discover Nordic UART service
+      - enable notifications on TX
+      - write RX with WriteWithoutResponse
+      - split writes into 20-byte chunks
     """
 
     def __init__(self, device, timeout=0.25):
@@ -226,29 +237,52 @@ class BleUartTransport:
             self._rx_buf.extend(data)
             self._rx_cv.notify_all()
 
-    def _on_disconnect(client):
-        print("BLE DISCONNECTED")
+    def _on_disconnect(self, _client):
+        self._connected = False
+        dprint("BLE DISCONNECTED")
 
     async def _async_connect(self):
-        self._client = BleakClient(self.device, disconnected_callback=self._on_disconnect)
-        await self._client.connect()
-        print("CONNECTED:", self._client.is_connected)
+        target = self.device
+        if hasattr(target, "address"):
+            target = target.address
+
+        dprint(f"BLE connect target: {target}")
+        self._client = BleakClient(target, disconnected_callback=self._on_disconnect)
+
+        await self._client.connect(timeout=BLE_CONNECT_TIMEOUT_S)
+
+        if not self._client.is_connected:
+            raise RuntimeError("BLE disconnected immediately after connect")
 
         services = self._client.services
-        tx_char = None
-        for s in services:
-            print("SERVICE", s.uuid)
-            for c in s.characteristics:
-                print("  CHAR", c.uuid, c.properties)
-                if c.uuid.lower() == BLE_TX_UUID.lower():
-                    tx_char = c
+        if services is None:
+            services = await self._client.get_services()
 
-        if tx_char is None:
-            raise RuntimeError(f"TX characteristic not found: {BLE_TX_UUID}")
+        uart_service_found = False
+        tx_found = False
+        rx_found = False
 
-        await asyncio.sleep(0.5)
-        await self._client.start_notify(tx_char, self._notification_handler)
+        for service in services:
+            if str(service.uuid).lower() == BLE_SERVICE_UUID.lower():
+                uart_service_found = True
+
+            for char in service.characteristics:
+                cu = str(char.uuid).lower()
+                if cu == BLE_TX_UUID.lower():
+                    tx_found = True
+                elif cu == BLE_RX_UUID.lower():
+                    rx_found = True
+
+        if not uart_service_found:
+            raise RuntimeError(f"BLE UART service not found: {BLE_SERVICE_UUID}")
+        if not tx_found:
+            raise RuntimeError(f"BLE TX characteristic not found: {BLE_TX_UUID}")
+        if not rx_found:
+            raise RuntimeError(f"BLE RX characteristic not found: {BLE_RX_UUID}")
+
+        await self._client.start_notify(BLE_TX_UUID, self._notification_handler)
         self._connected = True
+        dprint("BLE notify enabled on TX characteristic")
 
     async def _async_disconnect(self):
         try:
@@ -257,14 +291,22 @@ class BleUartTransport:
                     await self._client.stop_notify(BLE_TX_UUID)
                 except Exception:
                     pass
-                await self._client.disconnect()
+                try:
+                    await self._client.disconnect()
+                except Exception:
+                    pass
         finally:
+            with self._rx_cv:
+                self._rx_buf.clear()
+                self._rx_cv.notify_all()
             self._connected = False
             self._client = None
 
     async def _async_write(self, data: bytes):
         if not self._client or not self._connected:
             raise OSError("BLE client is not connected")
+
+        # VESC Tool behavior: 20-byte chunks, WriteWithoutResponse
         for i in range(0, len(data), BLE_WRITE_CHUNK):
             chunk = data[i:i + BLE_WRITE_CHUNK]
             await self._client.write_gatt_char(BLE_RX_UUID, chunk, response=False)
@@ -277,25 +319,31 @@ class BleUartTransport:
     def open(self):
         if self._thread is not None:
             return
+
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
+
         while self._loop is None:
             time.sleep(0.01)
+
         fut = asyncio.run_coroutine_threadsafe(self._async_connect(), self._loop)
-        fut.result(timeout=10.0)
+        fut.result(timeout=BLE_CONNECT_TIMEOUT_S + 5.0)
 
     def close(self):
         if self._loop is None or self._thread is None:
             return
+
         try:
             fut = asyncio.run_coroutine_threadsafe(self._async_disconnect(), self._loop)
             fut.result(timeout=5.0)
         except Exception:
             pass
+
         try:
             self._loop.call_soon_threadsafe(self._loop.stop)
         except Exception:
             pass
+
         self._thread.join(timeout=2.0)
         self._thread = None
         self._loop = None
@@ -314,14 +362,17 @@ class BleUartTransport:
 
     def read(self, size=1):
         deadline = time.perf_counter() + float(self.timeout or 0.25)
+
         with self._rx_cv:
             while len(self._rx_buf) < size:
                 remaining = deadline - time.perf_counter()
                 if remaining <= 0:
                     break
                 self._rx_cv.wait(timeout=remaining)
+
             if len(self._rx_buf) == 0:
                 return b""
+
             n = min(size, len(self._rx_buf))
             out = bytes(self._rx_buf[:n])
             del self._rx_buf[:n]
@@ -330,6 +381,7 @@ class BleUartTransport:
     def write(self, data):
         if not isinstance(data, (bytes, bytearray)):
             data = bytes(data)
+
         fut = asyncio.run_coroutine_threadsafe(self._async_write(bytes(data)), self._loop)
         fut.result(timeout=5.0)
         return len(data)
@@ -338,8 +390,9 @@ class BleUartTransport:
         pass
 
     def reset_input_buffer(self):
-        with self._rx_lock:
+        with self._rx_cv:
             self._rx_buf.clear()
+            self._rx_cv.notify_all()
 
     def reset_output_buffer(self):
         pass
@@ -347,20 +400,55 @@ class BleUartTransport:
 
 def scan_ble_devices_blocking():
     async def _scan():
-        return await BleakScanner.discover(timeout=8.0)
+        seen = await BleakScanner.discover(timeout=BLE_SCAN_TIMEOUT_S, return_adv=True)
+
+        uart_devices = []
+        named_devices = []
+        others = []
+
+        for _addr, item in seen.items():
+            if isinstance(item, tuple) and len(item) == 2:
+                dev, adv = item
+            else:
+                dev = item
+                adv = None
+        
+
+            name = (getattr(dev, "name", None) or getattr(adv, "local_name", "") or "").strip()
+            uuids = [u.lower() for u in (getattr(adv, "service_uuids", None) or [])]
+
+            has_uart = BLE_SERVICE_UUID.lower() in uuids
+            has_name = bool(name)
+
+            if has_uart:
+                uart_devices.append(dev)
+            elif has_name:
+                named_devices.append(dev)
+            else:
+                others.append(dev)
+
+        # STRICT priority (like VESC Tool intent)
+        result = uart_devices if uart_devices else named_devices
+
+        # fallback only if nothing useful
+        if not result:
+            result = others
+
+        # remove duplicates
+        unique = {}
+        for dev in result:
+            addr = getattr(dev, "address", None)
+            if addr:
+                unique[addr] = dev
+
+        return list(unique.values())
 
     loop = asyncio.new_event_loop()
     try:
         asyncio.set_event_loop(loop)
         return loop.run_until_complete(_scan())
     finally:
-        try:
-            loop.run_until_complete(loop.shutdown_asyncgens())
-        except Exception:
-            pass
-        asyncio.set_event_loop(None)
         loop.close()
-
 # =========================
 # Global state
 # =========================
@@ -390,7 +478,7 @@ ENABLE_COMMANDS = True
 TELEMETRY_PERIOD_S = 0.025
 COMMAND_KEEPALIVE_S = 0.5
 TX_GUARD_S = 0.0125
-REOPEN_BACKOFF_S = 3.0
+REOPEN_BACKOFF_S = 10.0
 HARD_TIMEOUT_LIMIT = 8
 DUTY_EPS = 1e-4
 CURRENT_EPS = 0.02
@@ -1092,21 +1180,28 @@ class Ui_MainWindow(object):
             return
 
         for dev in devices:
-            name = dev.name or "<no name>"
-            display_text = f"{name} - {dev.address}"
+            name = getattr(dev, "name", None) or "<no name>"
+            addr = getattr(dev, "address", None) or "<no address>"
+            display_text = f"{name} - {addr}"
             self.comboBox_portselect.addItem(display_text, dev)
+
+        # Prefer the previously configured default address if present.
+        for i in range(self.comboBox_portselect.count()):
+            dev = self.comboBox_portselect.itemData(i)
+            if dev is not None and getattr(dev, "address", "").upper() == BLE_ADDRESS.upper():
+                self.comboBox_portselect.setCurrentIndex(i)
+                break
 
         log_event(f"BLE scan: found {len(devices)} BLE device(s)")
         self.statusbar.showMessage(f"Found {len(devices)} BLE device(s)")
-
+    
     def on_ble_scan_failed(self, err):
         self.comboBox_portselect.clear()
         self.comboBox_portselect.addItem("BLE scan failed", None)
         self.pushButton_refresh.setEnabled(True)
-
         log_event(f"BLE scan failed: {err}")
         self.statusbar.showMessage(f"BLE scan failed: {err}")
-        
+
     def build_main_tab(self):
         layout = QtWidgets.QVBoxLayout(self.tab_main)
         layout.setSpacing(4)
@@ -1491,22 +1586,25 @@ class Ui_MainWindow(object):
 
     def start_com(self):
         global selected_port
-        idx = self.comboBox_portselect.currentIndex()
-        selected_port = self.comboBox_portselect.itemData(idx)   # this is now a BLEDevice
 
-        if selected_port is not None:
-            with param_state_lock:
-                param_state["pending_initial_refresh"] = True
-                param_state["ui_sync_needed"] = False
-                param_state["ui_sync_update_targets"] = False
+        dev = self.comboBox_portselect.currentData()
+        if dev is None:
+            self.statusbar.showMessage("No BLE device selected")
+            log_event("Connect requested without a valid BLE device selection")
+            return
 
-            set_diag(selected_port=selected_port.address)
-            log_event(f"Connect requested on {selected_port.address} ({selected_port.name})")
-            vesc_com_flag.set()
-            self.statusbar.showMessage(f"Connect requested to {selected_port.address}")
-        else:
-            self.statusbar.showMessage("No valid BLE device selected")
-            log_event("Connect requested but no valid BLE device selected")
+        selected_port = dev
+
+        with param_state_lock:
+            param_state["pending_initial_refresh"] = True
+            param_state["ui_sync_needed"] = False
+            param_state["ui_sync_update_targets"] = False
+
+        port_label = getattr(selected_port, "address", str(selected_port))
+        set_diag(selected_port=port_label)
+        log_event(f"Connect requested on {port_label}")
+        vesc_com_flag.set()
+        self.statusbar.showMessage(f"Connect requested to {port_label}")
 
     def stop_com(self):
         global vesc_session
@@ -1814,10 +1912,11 @@ class Ui_MainWindow(object):
             self.update_debug_view()
         except Exception:
             err = traceback.format_exc()
-            inc_diag("gui_errors")
-            set_diag(last_gui_error=err)
-            log_event("GUI refresh error")
+            set_diag(serial_open=False, last_comm_error=err)
+            log_event(f"Communication session failed on {port}")
             dprint(err)
+            vesc_com_flag.clear()
+            time.sleep(REOPEN_BACKOFF_S)
 
     def safe_set_curve(self, curve, x, y, name):
         try:
@@ -1982,26 +2081,40 @@ def send_command(vesc, mode, value):
 # =========================
 def vesc_communication():
     global vesc_values, selected_port, control_value, control_mode, vesc_session
+
     log_event("Comm thread started")
+
     while True:
-        set_diag(comm_thread_alive=True, read_only_mode=READ_ONLY_MODE, commands_enabled=ENABLE_COMMANDS)
+        set_diag(
+            comm_thread_alive=True,
+            read_only_mode=READ_ONLY_MODE,
+            commands_enabled=ENABLE_COMMANDS,
+        )
+
         if not (vesc_com_flag.is_set() and selected_port):
             set_diag(serial_open=False)
             time.sleep(0.1)
             continue
+
         port = selected_port
+        port_label = getattr(port, "address", str(port))
+
         session_id = int(time.time() * 1000) % 100000000
-        set_diag(serial_session_id=session_id, selected_port=port)
+        set_diag(serial_session_id=session_id, selected_port=port_label)
+
         try:
-            log_event(f"Opening BLE VESC bridge on {port.address} (session {session_id})")
+            log_event(f"Opening BLE VESC bridge on {port_label} (session {session_id})")
+
             with BleUartTransport(device=port, timeout=0.25) as ble_port:
-                # This assumes your pyvesc VESC class accepts a serial-like object.
                 vesc = VESC(serial_port=ble_port, start_heartbeat=False, baudrate=115200, timeout=0.25)
                 attach_custom_io(vesc)
+
                 with vesc_session_lock:
                     vesc_session = vesc
+
                 set_diag(serial_open=True)
-                log_event(f"BLE link open OK on {port.address} (session {session_id})")
+                log_event(f"BLE link open OK on {port_label} (session {session_id})")
+
                 try:
                     runtime = get_bike_runtime(vesc)
                     log_event(
@@ -2014,26 +2127,36 @@ def vesc_communication():
                     )
                 except Exception as e:
                     log_event(f"COMM_GET_BIKE_RUNTIME FAIL: {type(e).__name__}: {e}")
+
                 try:
                     vals = vesc.get_measurements()
-                    log_event(f"Stock values OK: rpm={getattr(vals, 'rpm', 'n/a')}, vin={getattr(vals, 'v_in', 'n/a')}")
+                    log_event(
+                        f"Stock values OK: rpm={getattr(vals, 'rpm', 'n/a')}, "
+                        f"vin={getattr(vals, 'v_in', 'n/a')}"
+                    )
                 except Exception as e:
                     log_event(f"Stock values failed: {type(e).__name__}: {e}")
+
                 try:
                     run_custom_message_selftest(vesc)
                 except Exception as e:
                     log_event(f"Custom self-test crashed: {type(e).__name__}: {e}")
+
                 time.sleep(0.2)
+
                 try:
                     vesc.recover_from_timeout()
                     log_event("Initial RX/TX buffer reset after open")
                 except Exception as e:
                     log_event(f"Initial recovery after open failed: {type(e).__name__}: {e}")
+
                 next_param_refresh_time = 0.0
+
                 try:
                     with param_state_lock:
                         need_initial = bool(param_state["pending_initial_refresh"])
                         param_state["pending_initial_refresh"] = False
+
                     if need_initial:
                         with vesc_session_lock:
                             read_param_blocks_from_session(vesc, update_targets=True)
@@ -2041,29 +2164,38 @@ def vesc_communication():
                         log_event("Initial parameter refresh done")
                 except Exception as e:
                     log_event(f"Initial parameter refresh failed: {type(e).__name__}: {e}")
+
                 consecutive_timeouts = 0
                 last_cmd_sent = None
                 last_command_tx_time = 0.0
                 next_telem_time = time.perf_counter()
+
                 while vesc_com_flag.is_set() and selected_port == port:
                     now = time.perf_counter()
                     set_diag(last_loop_time=now)
+
                     if prog_flag.is_set():
                         control_mode = "Speed"
                         control_value = 0.0
                     else:
                         control_mode = "Current"
                         control_value = 0.0
+
                     if now < next_telem_time:
                         time.sleep(min(0.001, next_telem_time - now))
                         continue
+
                     cycle_start = time.perf_counter()
+
                     try:
                         response = get_measurements_exp(vesc)
                         new_values = build_vesc_values(response)
+
                         with vesc_values_lock:
                             vesc_values = new_values
+
                         append_history(new_values)
+
                         rx_now = time.perf_counter()
                         with diag_lock:
                             diag["last_rx_time"] = rx_now
@@ -2071,63 +2203,92 @@ def vesc_communication():
                             diag["consecutive_read_errors"] = 0
                             diag["consecutive_write_errors"] = 0
                             diag["last_response_summary"] = response_summary(response)
+
                         consecutive_timeouts = 0
+
                     except TimeoutError as e:
                         err = f"{type(e).__name__}: {e}"
                         inc_diag("read_errors")
                         set_diag(last_read_error=err, last_comm_error=err)
+
                         with diag_lock:
                             diag["consecutive_read_errors"] += 1
+
                         consecutive_timeouts += 1
-                        log_event(f"READ TIMEOUT on {port}: {err} ({consecutive_timeouts})")
+                        log_event(f"READ TIMEOUT on {port_label}: {err} ({consecutive_timeouts})")
+
                         try:
                             vesc.recover_from_timeout()
                             log_event("Soft recovery: RX/TX buffers reset")
                         except Exception as rec_e:
                             log_event(f"Soft recovery failed: {type(rec_e).__name__}: {rec_e}")
+
                         if consecutive_timeouts >= HARD_TIMEOUT_LIMIT:
                             log_event("Too many timeouts, forcing reopen")
                             raise
+
                         next_telem_time = time.perf_counter() + TELEMETRY_PERIOD_S
                         time.sleep(0.05)
                         continue
+
                     except Exception as e:
                         err = f"{type(e).__name__}: {e}"
                         inc_diag("read_errors")
-                        set_diag(last_read_error=err, last_comm_error=err, serial_open=False)
+                        set_diag(
+                            last_read_error=err,
+                            last_comm_error=err,
+                            serial_open=False,
+                        )
+
                         with diag_lock:
                             diag["consecutive_read_errors"] += 1
-                        log_event(f"READ ERROR on {port}: {err}")
+
+                        log_event(f"READ ERROR on {port_label}: {err}")
                         raise
+
                     time.sleep(TX_GUARD_S)
+
                     if not READ_ONLY_MODE and ENABLE_COMMANDS:
                         cmd_now = snapshot_command()
+
                         should_send = False
                         if command_changed(last_cmd_sent, cmd_now):
                             should_send = True
                         elif (time.perf_counter() - last_command_tx_time) >= COMMAND_KEEPALIVE_S:
                             should_send = True
+
                         if should_send or (cmd_now[0] == "Speed" and last_cmd_sent is None):
                             try:
                                 time.sleep(TX_GUARD_S * 2.0)
                                 send_command(vesc, cmd_now[0], cmd_now[1])
                                 time.sleep(TX_GUARD_S * 2.0)
+
                                 tx_now = time.perf_counter()
                                 with diag_lock:
                                     diag["last_tx_time"] = tx_now
                                     diag["tx_count"] += 1
                                     diag["consecutive_write_errors"] = 0
+
                                 last_command_tx_time = tx_now
                                 last_cmd_sent = cmd_now
+
                             except Exception as e:
                                 err = f"{type(e).__name__}: {e}"
                                 inc_diag("write_errors")
-                                set_diag(last_write_error=err, last_comm_error=err, serial_open=False)
+                                set_diag(
+                                    last_write_error=err,
+                                    last_comm_error=err,
+                                    serial_open=False,
+                                )
+
                                 with diag_lock:
                                     diag["consecutive_write_errors"] += 1
-                                log_event(f"WRITE ERROR on {port}: {err}")
+
+                                log_event(f"WRITE ERROR on {port_label}: {err}")
                                 raise
+
                         time.sleep(TX_GUARD_S)
+
                     try:
                         now_after = time.perf_counter()
                         if now_after >= next_param_refresh_time:
@@ -2136,13 +2297,19 @@ def vesc_communication():
                     except Exception as e:
                         log_event(f"Periodic parameter refresh failed: {type(e).__name__}: {e}")
                         next_param_refresh_time = time.perf_counter() + PARAM_REFRESH_PERIOD_S
+
                     next_telem_time = cycle_start + TELEMETRY_PERIOD_S
+
         except Exception:
             err = traceback.format_exc()
-            set_diag(serial_open=False, last_comm_error=err)
-            log_event(f"Communication session failed on {port}")
+            set_diag(
+                serial_open=False,
+                last_comm_error=err,
+            )
+            log_event(f"Communication session failed on {port_label}")
             dprint(err)
             time.sleep(REOPEN_BACKOFF_S)
+
         finally:
             with vesc_session_lock:
                 vesc_session = None
