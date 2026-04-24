@@ -127,15 +127,52 @@ class Ui_MainWindow(object):
 
     def build_charts_tab(self):
         layout = QtWidgets.QVBoxLayout(self.tab_charts)
+
         toolbar = QtWidgets.QHBoxLayout()
-        self.btn_autorange = QtWidgets.QPushButton("Auto Range"); self.btn_reset_x = QtWidgets.QPushButton("Reset X")
-        toolbar.addWidget(self.btn_autorange); toolbar.addWidget(self.btn_reset_x); toolbar.addStretch(1); layout.addLayout(toolbar)
-        self.plotWidget = pg.GraphicsLayoutWidget(); self.plotWidget.setBackground('k'); layout.addWidget(self.plotWidget)
-        plot_defs = [("Currents", ["IQ Filtered", "IQ Set"]), ("RPMs", ["RPM Motor", "RPM Set", "LESO RPM"]), ("Torques", ["Torque FF", "Torque Motor", "Pedal Torque Observed", "T_F_combine", "T_friction"]), ("Speed km/h", ["Setpoint Speed km/h", "Real Speed km/h"]), ("Errors", ["Speed Error", "Pos Term Speed", "Position Error deg"]), ("Force / Incline", ["F_combine", "Incline Deg Ist"]), ("UW", ["UW Angle SP", "UW Theta"])]
+        self.btn_autorange = QtWidgets.QPushButton("Auto Range")
+        self.btn_reset_x = QtWidgets.QPushButton("Reset X")
+        toolbar.addWidget(self.btn_autorange)
+        toolbar.addWidget(self.btn_reset_x)
+        toolbar.addStretch(1)
+        layout.addLayout(toolbar)
+
+        self.plotWidget = pg.GraphicsLayoutWidget()
+        self.plotWidget.setBackground('k')
+        layout.addWidget(self.plotWidget)
+
+        plot_defs = [
+            ("Currents", ["IQ Filtered", "IQ Set", "IQ Instant"]),            
+            ("RPMs", ["RPM Motor", "RPM Set", "LESO RPM"]),
+            ("Torques", ["Torque FF", "Torque Motor", "Pedal Torque Observed", "T_F_combine", "T_friction"]),
+            ("Errors", ["Speed Error", "Pos Term Speed", "Position Error deg"]),
+            ("Force / Incline", ["F_combine", "Incline Deg Ist"]),
+            ("UW", ["UW Angle SP", "UW Theta"]),
+            ("Speed km/h", ["Setpoint Speed km/h", "Real Speed km/h"]),
+            ("Input Electrical", ["Input Voltage", "Battery Current", "Power In"]),
+        ]
+
+        pens = [
+            pg.mkPen('c', width=1.5),
+            pg.mkPen('y', width=1.5),
+            pg.mkPen('g', width=1.5),
+            pg.mkPen('m', width=1.5),
+            pg.mkPen('r', width=1.5),
+            pg.mkPen((255, 165, 0), width=1.5),
+            pg.mkPen((180, 180, 255), width=1.5),
+        ]
+
         for i, (title, keys) in enumerate(plot_defs):
-            p = make_plot(self.plotWidget, i // 2, i % 2, title); self.chart_plots.append(p)
-            for key in keys:
-                self.chart_curves[key] = p.plot(name=key)
+            row = i // 2
+            col = i % 2
+
+            p = make_plot(self.plotWidget, row, col, title)
+            self.chart_plots.append(p)
+
+            for j, key in enumerate(keys):
+                self.chart_curves[key] = p.plot(
+                    pen=pens[j % len(pens)],
+                    name=key
+                )
 
     def build_debug_tab(self):
         layout = QtWidgets.QVBoxLayout(self.tab_debug)

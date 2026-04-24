@@ -222,30 +222,26 @@ def send_current_zero(vesc):
 
 
 def send_command(vesc, mode, value):
-    with vesc_values_lock:
-        local_values = dict(state.vesc_values)
+    ctrl_active = 0
 
-    ctrl_active = int(local_values.get("Ctrl Active", 0))
+    try:
+        with vesc_values_lock:
+            local_values = dict(vesc_values)
+        ctrl_active = int(local_values.get("Ctrl Active", 0))
+    except Exception:
+        ctrl_active = 0
 
-    if mode == "Duty Cycle":
-        msg = SetDuty(); msg.duty = float(value)
-        vesc.send_custom_no_reply(fwd_msg(msg))
-    elif mode == "Current":
+    can_id = get_target_can_id() if USE_CAN_FORWARD else None
+
+    if mode == "Current":
         if ctrl_active:
             stop_bike_sim(vesc)
         else:
-            send_current_zero(vesc)
-    elif mode == "Position":
-        msg = SetServoPos(); msg.servo_pos = float(value)
-        vesc.send_custom_no_reply(fwd_msg(msg))
+            vesc.set_current(0.0, can_id=can_id)
+
     elif mode == "Speed":
         if not ctrl_active:
             start_bike_sim(vesc)
-    else:
-        if ctrl_active:
-            stop_bike_sim(vesc)
-        else:
-            send_current_zero(vesc)
 
 
 def read_param_blocks_from_session(vesc, update_targets=False):

@@ -22,8 +22,8 @@ class SetDuty(metaclass=VESCMessage):
 class SetServoPos(metaclass=VESCMessage):
     id = cmd_id("COMM_SET_SERVO_POS", 12)
     fields = [('servo_pos', 'h', 1000)]
-
 """
+
 class StartBikeSim(metaclass=VESCMessage):
     id = 167
     fields = []
