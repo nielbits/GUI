@@ -3,3 +3,14 @@
 /import socket.py
 /test_nanolog_tcp.py
 /venv
+widgets.py:Zone.Identifier
+__pycache__/config.cpython-312.pyc
+__pycache__/diagnostics.cpython-312.pyc
+.gitignore
+__pycache__/state.cpython-312.pyc
+__pycache__/vesc_comm.cpython-312.pyc
+.gitignore
+__pycache__/telemetry.cpython-312.pyc
+__pycache__/gui.cpython-312.pyc
+__pycache__/widgets.cpython-312.pyc
+__pycache__/vesc_messages.cpython-312.pyc
