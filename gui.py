@@ -149,8 +149,8 @@ class Ui_MainWindow(object):
             ("UW", ["UW Angle SP", "UW Theta"]),
             ("Speed km/h", ["Setpoint Speed km/h", "Real Speed km/h"]),
             ("Input Electrical", ["Input Voltage", "Battery Current", "Power In"]),
-            ("Ctrl SM Counts", ["Ctrl SM Still Cycles", "Ctrl SM Index Lost Cycles"]),
-            ("Ctrl SM Reset Reason", ["Ctrl SM Reset Reason"]),
+            #("Ctrl SM Counts", ["Ctrl SM Still Cycles", "Ctrl SM Index Lost Cycles"]),
+            #("Ctrl SM Reset Reason", ["Ctrl SM Reset Reason"]),
         ]
 
         pens = [
