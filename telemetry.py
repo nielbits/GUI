@@ -78,6 +78,7 @@ def build_vesc_values(response):
     real_speed_kmh = estimate_real_speed_kmh(rpm_erpm, gear_ratio)
     setpoint_speed_kmh = estimate_setpoint_speed_kmh(model_speed, gear_ratio)
 
+    ctrl_sm_state = int(getattr(response, "ctrl_sm_state", 0))
     return {
         "RPM Motor": rpm_erpm / POLE_PAIRS,
         "RPM Set": erpm_soll / POLE_PAIRS,
@@ -98,7 +99,7 @@ def build_vesc_values(response):
         "Pedal Torque Observed": getattr(response, "tp_observed", 0.0),
         "Torque Motor": -getattr(response, "torque_motor", 0.0),
         "Torque FF": -getattr(response, "torque_ff", 0.0),
-        "Param Index": getattr(response, "param_index", 0),
+        "Ctrl SM Reset Reason": int(getattr(response, "ctrl_sm_reset_reason", 0)),
         "Param Value": getattr(response, "param_from_index", 0.0),
         "Pos Term Speed": getattr(response, "pos_term_speed", 0.0),
         "Speed Error": getattr(response, "speed_error", 0.0),
@@ -108,9 +109,12 @@ def build_vesc_values(response):
         "Position Error deg": position_error_deg,
         "Ctrl Active": get_status_bit(status_bits_ext, STATUS_BIT_CTRL_ACTIVE),
         "Forced FW": get_status_bit(status_bits_ext, STATUS_BIT_FORCED_FW),
-        "START": get_status_bit(status_bits_ext, STATUS_BIT_START),
-        "INDEX_FOUND": get_status_bit(status_bits_ext, STATUS_BIT_INDEX_FOUND),
-        "ENABLE": get_status_bit(status_bits_ext, STATUS_BIT_ENABLE),
+        "START": int(ctrl_sm_state == 0),
+        "INDEX_FOUND": int(ctrl_sm_state == 1),
+        "ENABLE": int(ctrl_sm_state == 2),
+        "Ctrl SM State": ctrl_sm_state,
+        "Ctrl SM Still Cycles": int(getattr(response, "ctrl_sm_still_cycles", 0)),
+        "Ctrl SM Index Lost Cycles": int(getattr(response, "ctrl_sm_index_lost_cycles", 0)),
         "Status Bits Ext": status_bits_ext,
         "Power In": v_in * avg_input_current,
     }

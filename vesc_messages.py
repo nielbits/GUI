@@ -72,7 +72,7 @@ class GetValuesExp(metaclass=VESCMessage):
         ('uw_theta', 'i', 10000),
         ('leso_omega', 'i', 10000),
         ('tp_observed', 'i', 10000),
-        ('param_index', 'i', 1),
+        ('ctrl_sm_reset_reason', 'i', 1),
         ('i_res', 'i', 1000000),
         ('uw_angle_sp', 'i', 10000),
         ('param_from_index', 'i', 1000),
@@ -82,9 +82,9 @@ class GetValuesExp(metaclass=VESCMessage):
         ('incline_deg_ist', 'i', 1000),
         ('torque_motor', 'i', 1000),
         ('torque_ff', 'i', 1000),
-        ('test_7_007', 'i', 1000),
-        ('test_8_008', 'i', 1000),
-        ('test_9_009', 'i', 1000),
+        ('ctrl_sm_state', 'i', 1000),
+        ('ctrl_sm_still_cycles', 'i', 1000),
+        ('ctrl_sm_index_lost_cycles', 'i', 1000),
         ('status_bits_ext', 'I', 1),
     ]
 

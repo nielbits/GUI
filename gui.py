@@ -149,6 +149,8 @@ class Ui_MainWindow(object):
             ("UW", ["UW Angle SP", "UW Theta"]),
             ("Speed km/h", ["Setpoint Speed km/h", "Real Speed km/h"]),
             ("Input Electrical", ["Input Voltage", "Battery Current", "Power In"]),
+            ("Ctrl SM Counts", ["Ctrl SM Still Cycles", "Ctrl SM Index Lost Cycles"]),
+            ("Ctrl SM Reset Reason", ["Ctrl SM Reset Reason"]),
         ]
 
         pens = [
@@ -167,6 +169,8 @@ class Ui_MainWindow(object):
 
             p = make_plot(self.plotWidget, row, col, title)
             self.chart_plots.append(p)
+            if title == "Ctrl SM Reset Reason":
+                p.setYRange(0.0, 3.0, padding=0.0)
 
             for j, key in enumerate(keys):
                 self.chart_curves[key] = p.plot(
@@ -296,9 +300,15 @@ class Ui_MainWindow(object):
 
     def update_telemetry_table(self, values_dict):
         items = list(values_dict.items()); self.telemetryTable.setRowCount(len(items))
+        ctrl_sm_state_labels = {0: "START", 1: "INDEX_FOUND", 2: "ENABLE"}
         for row, (key, value) in enumerate(items):
             self.telemetryTable.setItem(row, 0, QtWidgets.QTableWidgetItem(str(key)))
-            value_str = f"{int(value)} (0b{int(value):032b})" if key == "Status Bits Ext" and isinstance(value, (int, float)) else (f"{value:.6f}" if isinstance(value, float) else str(value))
+            if key == "Status Bits Ext" and isinstance(value, (int, float)):
+                value_str = f"{int(value)} (0b{int(value):032b})"
+            elif key == "Ctrl SM State" and isinstance(value, (int, float)):
+                sm_state = int(value); value_str = f"{sm_state} ({ctrl_sm_state_labels.get(sm_state, 'UNKNOWN')})"
+            else:
+                value_str = f"{value:.6f}" if isinstance(value, float) else str(value)
             self.telemetryTable.setItem(row, 1, QtWidgets.QTableWidgetItem(value_str))
 
     def update_debug_view(self):
