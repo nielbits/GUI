@@ -5,8 +5,25 @@ import threading
 import traceback
 import types
 
-from pyvesc.VESC.VESC import VESC
-from pyvesc.protocol.interface import encode, encode_request, decode
+try:
+    from pyvesc.VESC.VESC import VESC
+except Exception:
+    try:
+        from pyvesc import VESC  # alternate packaging
+    except Exception:
+        VESC = None
+
+# Import encode/encode_request/decode from whichever pyvesc layout is available
+try:
+    from pyvesc.protocol.interface import encode, encode_request, decode
+except Exception:
+    try:
+        from pyvesc.protocol import interface as _pyvesc_interface
+        encode = getattr(_pyvesc_interface, 'encode', None)
+        encode_request = getattr(_pyvesc_interface, 'encode_request', None)
+        decode = getattr(_pyvesc_interface, 'decode', None)
+    except Exception:
+        encode = encode_request = decode = None
 
 from config import *
 from diagnostics import log_event, set_diag, inc_diag, debug_list_ports

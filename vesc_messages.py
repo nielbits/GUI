@@ -1,10 +1,24 @@
 # -*- coding: utf-8 -*-
 
-from pyvesc.protocol.base import VESCMessage
-from pyvesc.VESC.messages import VedderCmd
+try:
+    from pyvesc.protocol.base import VESCMessage
+except Exception:
+    # Fallback to built-in 'type' so classes can still use metaclass=VESCMessage
+    VESCMessage = type
+
+try:
+    from pyvesc.VESC.messages import VedderCmd
+except Exception:
+    try:
+        from pyvesc.VESC import messages as _vedder_messages
+        VedderCmd = getattr(_vedder_messages, 'VedderCmd', None)
+    except Exception:
+        VedderCmd = None
 
 
 def cmd_id(name, fallback):
+    if VedderCmd is None:
+        return int(fallback)
     value = getattr(VedderCmd, name, fallback)
     return int(getattr(value, "value", value))
 
@@ -37,56 +51,56 @@ class StopBikeSim(metaclass=VESCMessage):
 class GetValuesExp(metaclass=VESCMessage):
     id = 164
     fields = [
-        ('temp_fet', 'h', 10),
-        ('temp_motor', 'h', 10),
-        ('avg_motor_current', 'i', 100),
-        ('avg_input_current', 'i', 100),
-        ('avg_id', 'i', 100),
-        ('avg_iq', 'i', 100),
-        ('duty_cycle_now', 'h', 1000),
-        ('rpm', 'i', 1),
-        ('v_in', 'h', 10),
-        ('amp_hours', 'i', 10000),
-        ('amp_hours_charged', 'i', 10000),
-        ('watt_hours', 'i', 10000),
-        ('watt_hours_charged', 'i', 10000),
-        ('tachometer', 'i', 1),
-        ('tachometer_abs', 'i', 1),
-        ('mc_fault_code', 'c', 0),
-        ('pid_pos_now', 'i', 1000000),
-        ('app_controller_id', 'c', 0),
-        ('temp_mos1', 'h', 10),
-        ('temp_mos2', 'h', 10),
-        ('temp_mos3', 'h', 10),
-        ('avg_vd', 'i', 1000),
-        ('avg_vq', 'i', 1000),
-        ('status', 'c', 0),
-        ('erpm_soll', 'h', 1),
-        ('tf', 'h', 10000),
-        ('gear_ratio', 'i', 100),
-        ('id_current', 'i', 100),
-        ('iq_current', 'i', 100),
-        ('model_speed', 'h', 100),
-        ('f_combine', 'h', 10),
-        ('iq_set', 'i', 10000),
-        ('uw_theta', 'i', 10000),
-        ('leso_omega', 'i', 10000),
-        ('tp_observed', 'i', 10000),
-        ('ctrl_sm_reset_reason', 'i', 1),
-        ('i_res', 'i', 1000000),
-        ('uw_angle_sp', 'i', 10000),
-        ('param_from_index', 'i', 1000),
-        ('pos_term_speed', 'i', 1000),
-        ('speed_error', 'i', 1000),
-        ('t_f_combine', 'i', 1000),
-        ('incline_deg_ist', 'i', 1000),
-        ('torque_motor', 'i', 1000),
-        ('torque_ff', 'i', 1000),
-        ('ctrl_sm_state', 'i', 1000),
-        ('ctrl_sm_still_cycles', 'i', 1000),
-        ('ctrl_sm_index_lost_cycles', 'i', 1000),
-        ('status_bits_ext', 'I', 1),
-    ]
+    ('temp_fet', 'h', 10),
+    ('temp_motor', 'h', 10),
+    ('avg_motor_current', 'i', 100),
+    ('avg_input_current', 'i', 100),
+    ('avg_id', 'i', 100),
+    ('avg_iq', 'i', 100),
+    ('duty_cycle_now', 'h', 1000),
+    ('rpm', 'i', 1),
+    ('v_in', 'h', 10),
+    ('amp_hours', 'i', 10000),
+    ('amp_hours_charged', 'i', 10000),
+    ('watt_hours', 'i', 10000),
+    ('watt_hours_charged', 'i', 10000),
+    ('tachometer', 'i', 1),
+    ('tachometer_abs', 'i', 1),
+    ('mc_fault_code', 'c', 0),
+    ('pid_pos_now', 'i', 1000000),
+    ('app_controller_id', 'c', 0),
+    ('temp_mos1', 'h', 10),
+    ('temp_mos2', 'h', 10),
+    ('temp_mos3', 'h', 10),
+    ('avg_vd', 'i', 1000),
+    ('avg_vq', 'i', 1000),
+    ('status', 'c', 0),
+    ('erpm_soll', 'h', 1),
+    ('tf', 'h', 10000),
+    ('gear_ratio', 'i', 100),
+    ('id_current', 'i', 100),
+    ('iq_current', 'i', 100),
+    ('model_speed', 'h', 100),
+    ('f_combine', 'h', 10),
+    ('iq_set', 'i', 10000),
+    ('uw_theta', 'i', 10000),
+    ('leso_omega', 'i', 10000),
+    ('tp_observed', 'i', 10000),
+    ('ctrl_sm_reset_reason', 'i', 1),
+    ('i_res', 'i', 1000000),
+    ('uw_angle_sp', 'i', 10000),
+    ('param_from_index', 'i', 1000),
+    ('pos_term_speed', 'i', 1000),
+    ('speed_error', 'i', 1000),
+    ('t_f_combine', 'i', 1000),
+    ('incline_deg_ist', 'i', 1000),
+    ('torque_motor', 'i', 1000),
+    ('torque_ff', 'i', 1000),
+    ('ctrl_sm_state', 'i', 1000),
+    ('ctrl_sm_still_cycles', 'i', 1000),
+    ('ctrl_sm_index_lost_cycles', 'i', 1000),
+    ('status_bits_ext', 'I', 1)
+]
 
 
 class GetBikeRuntime(metaclass=VESCMessage):
