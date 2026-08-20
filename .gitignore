@@ -14,3 +14,7 @@ __pycache__/telemetry.cpython-312.pyc
 __pycache__/gui.cpython-312.pyc
 __pycache__/widgets.cpython-312.pyc
 __pycache__/vesc_messages.cpython-312.pyc
+gui.log
+type=GetBikeRuntime,
+type=GetRotorPosition,
+type=GetControlParams,
