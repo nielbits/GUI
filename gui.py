@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 
+import json
 import math
 import sys
+import threading
 import time
 import traceback
 import serial.tools.list_ports
@@ -23,6 +25,25 @@ from vesc_comm import (
 from vesc_messages import SetBikeRuntime, SetBikeSimParams, SetControlParams
 
 
+CHART_PLOT_DEFS = [
+    ("Currents", ["IQ Filtered", "IQ Set", "IQ Instant"]),
+    ("RPMs", ["RPM Motor", "RPM Set", "LESO RPM"]),
+    ("Torques", ["Torque FF", "Torque Motor", "Pedal Torque Observed", "T_F_combine", "T_friction"]),
+    ("Errors", ["Speed Error", "Pos Term Speed", "Position Error deg"]),
+    ("Force / Incline", ["F_combine", "Incline Deg Ist"]),
+    ("UW", ["UW Angle SP", "UW Theta"]),
+    ("Speed km/h", ["Setpoint Speed km/h", "Real Speed km/h"]),
+    ("Input Electrical", ["Input Voltage", "Battery Current", "Power In"]),
+   # ("Ctrl SM Counts", ["Ctrl SM Still Cycles", "Ctrl SM Index Lost Cycles"]),
+   # ("Ctrl SM Reset Reason", ["Ctrl SM Reset Reason"]),
+]
+
+MAIN_PLOT_DEFS = [
+    ("Observer Torque", ["Pedal Torque Observed"]),
+    ("Real Speed", ["Real Speed km/h"]),
+]
+
+
 class Ui_MainWindow(object):
     def setupUi(self, MainWindow):
         MainWindow.setObjectName("MainWindow")
@@ -31,6 +52,9 @@ class Ui_MainWindow(object):
         MainWindow.setCentralWidget(self.centralwidget)
         self.chart_plots = []
         self.chart_curves = {}
+        self.chart_plot_widgets = {}
+        self.chart_config_items = {}
+        self.chart_selections = {}
         self.scroll_mode = True
         self.build_ui(MainWindow)
         self.make_connections()
@@ -131,29 +155,89 @@ class Ui_MainWindow(object):
         toolbar = QtWidgets.QHBoxLayout()
         self.btn_autorange = QtWidgets.QPushButton("Auto Range")
         self.btn_reset_x = QtWidgets.QPushButton("Reset X")
+        self.btn_dump_charts = QtWidgets.QPushButton("Dump Charts")
         toolbar.addWidget(self.btn_autorange)
         toolbar.addWidget(self.btn_reset_x)
+        toolbar.addWidget(self.btn_dump_charts)
         toolbar.addStretch(1)
         layout.addLayout(toolbar)
 
-        self.plotWidget = pg.GraphicsLayoutWidget()
-        self.plotWidget.setBackground('k')
-        layout.addWidget(self.plotWidget)
+        self.chart_tabs = QtWidgets.QTabWidget()
+        layout.addWidget(self.chart_tabs, 1)
 
-        plot_defs = [
-            ("Currents", ["IQ Filtered", "IQ Set", "IQ Instant"]),            
-            ("RPMs", ["RPM Motor", "RPM Set", "LESO RPM"]),
-            ("Torques", ["Torque FF", "Torque Motor", "Pedal Torque Observed", "T_F_combine", "T_friction"]),
-            ("Errors", ["Speed Error", "Pos Term Speed", "Position Error deg"]),
-            ("Force / Incline", ["F_combine", "Incline Deg Ist"]),
-            ("UW", ["UW Angle SP", "UW Theta"]),
-            ("Speed km/h", ["Setpoint Speed km/h", "Real Speed km/h"]),
-            ("Input Electrical", ["Input Voltage", "Battery Current", "Power In"]),
-           # ("Ctrl SM Counts", ["Ctrl SM Still Cycles", "Ctrl SM Index Lost Cycles"]),
-           # ("Ctrl SM Reset Reason", ["Ctrl SM Reset Reason"]),
-        ]
+        self.tab_chart1 = QtWidgets.QWidget()
+        self.tab_chart2 = QtWidgets.QWidget()
+        self.tab_chart_config = QtWidgets.QWidget()
+        self.chart_tabs.addTab(self.tab_chart1, "Chart 1")
+        self.chart_tabs.addTab(self.tab_chart2, "Chart 2")
+        self.chart_tabs.addTab(self.tab_chart_config, "Configure")
 
-        pens = [
+        for tab_index, tab_widget in [(0, self.tab_chart1), (1, self.tab_chart2)]:
+            tab_layout = QtWidgets.QVBoxLayout(tab_widget)
+            tab_layout.setContentsMargins(0, 0, 0, 0)
+            plot_widget = pg.GraphicsLayoutWidget()
+            plot_widget.setBackground('k')
+            self.chart_plot_widgets[tab_index] = plot_widget
+            tab_layout.addWidget(plot_widget, 1)
+
+        split_at = (len(CHART_PLOT_DEFS) + 1) // 2
+        self.chart_selections = {
+            0: {title for i, (title, _) in enumerate(CHART_PLOT_DEFS) if i < split_at},
+            1: {title for i, (title, _) in enumerate(CHART_PLOT_DEFS) if i >= split_at},
+        }
+        self.build_chart_config_tab()
+        self.rebuild_chart_tabs()
+
+    def build_chart_config_tab(self):
+        layout = QtWidgets.QVBoxLayout(self.tab_chart_config)
+
+        button_row = QtWidgets.QHBoxLayout()
+        self.btn_chart1_all = QtWidgets.QPushButton("Select All Chart 1")
+        self.btn_chart1_clear = QtWidgets.QPushButton("Clear Chart 1")
+        self.btn_chart2_all = QtWidgets.QPushButton("Select All Chart 2")
+        self.btn_chart2_clear = QtWidgets.QPushButton("Clear Chart 2")
+        for button in [self.btn_chart1_all, self.btn_chart1_clear, self.btn_chart2_all, self.btn_chart2_clear]:
+            button_row.addWidget(button)
+        button_row.addStretch(1)
+        layout.addLayout(button_row)
+
+        self.chart_config_table = QtWidgets.QTableWidget()
+        self.chart_config_table.setColumnCount(4)
+        self.chart_config_table.setHorizontalHeaderLabels(["Chart", "Signals", "Chart 1", "Chart 2"])
+        self.chart_config_table.setRowCount(len(CHART_PLOT_DEFS))
+        self.chart_config_table.setAlternatingRowColors(True)
+        self.chart_config_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.chart_config_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.chart_config_table.verticalHeader().setVisible(False)
+
+        header = self.chart_config_table.horizontalHeader()
+        header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
+        header.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeToContents)
+
+        for row, (title, keys) in enumerate(CHART_PLOT_DEFS):
+            title_item = QtWidgets.QTableWidgetItem(title)
+            title_item.setFlags(title_item.flags() & ~QtCore.Qt.ItemIsEditable)
+            self.chart_config_table.setItem(row, 0, title_item)
+
+            signals_item = QtWidgets.QTableWidgetItem(", ".join(keys))
+            signals_item.setFlags(signals_item.flags() & ~QtCore.Qt.ItemIsEditable)
+            self.chart_config_table.setItem(row, 1, signals_item)
+
+            for col, tab_index in [(2, 0), (3, 1)]:
+                item = QtWidgets.QTableWidgetItem()
+                item.setFlags(QtCore.Qt.ItemIsUserCheckable | QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsSelectable)
+                item.setCheckState(QtCore.Qt.Checked if title in self.chart_selections[tab_index] else QtCore.Qt.Unchecked)
+                item.setData(QtCore.Qt.UserRole, title)
+                item.setTextAlignment(QtCore.Qt.AlignCenter)
+                self.chart_config_table.setItem(row, col, item)
+                self.chart_config_items[(tab_index, title)] = item
+
+        layout.addWidget(self.chart_config_table, 1)
+
+    def chart_pens(self):
+        return [
             pg.mkPen('c', width=1.5),
             pg.mkPen('y', width=1.5),
             pg.mkPen('g', width=1.5),
@@ -163,20 +247,75 @@ class Ui_MainWindow(object):
             pg.mkPen((180, 180, 255), width=1.5),
         ]
 
-        for i, (title, keys) in enumerate(plot_defs):
-            row = i // 2
-            col = i % 2
+    def selected_chart_defs(self, tab_index):
+        selected_titles = self.chart_selections.get(tab_index, set())
+        return [(title, keys) for title, keys in CHART_PLOT_DEFS if title in selected_titles]
 
-            p = make_plot(self.plotWidget, row, col, title)
-            self.chart_plots.append(p)
-            if title == "Ctrl SM Reset Reason":
-                p.setYRange(0.0, 3.0, padding=0.0)
+    def chart_grid_position(self, index, count):
+        if count <= 2:
+            return index, 0, 1
+        if count % 2 == 1 and index == count - 1:
+            return index // 2, 0, 2
+        return index // 2, index % 2, 1
 
-            for j, key in enumerate(keys):
-                self.chart_curves[key] = p.plot(
-                    pen=pens[j % len(pens)],
-                    name=key
-                )
+    def rebuild_chart_tabs(self):
+        self.chart_plots = []
+        self.chart_curves = {}
+        pens = self.chart_pens()
+
+        for tab_index, plot_widget in self.chart_plot_widgets.items():
+            plot_widget.clear()
+            plot_defs = self.selected_chart_defs(tab_index)
+            if not plot_defs:
+                label = pg.LabelItem("No charts selected", color=(220, 220, 220), size="14pt")
+                plot_widget.addItem(label, row=0, col=0)
+                continue
+
+            first_plot = None
+            for i, (title, keys) in enumerate(plot_defs):
+                row, col, colspan = self.chart_grid_position(i, len(plot_defs))
+                plot = make_plot(plot_widget, row, col, title, colspan=colspan)
+                self.chart_plots.append(plot)
+                if first_plot is None:
+                    first_plot = plot
+                else:
+                    plot.setXLink(first_plot)
+                if title == "Ctrl SM Reset Reason":
+                    plot.setYRange(0.0, 3.0, padding=0.0)
+
+                for j, key in enumerate(keys):
+                    curve = plot.plot(
+                        pen=pens[j % len(pens)],
+                        name=key
+                    )
+                    self.chart_curves.setdefault(key, []).append(curve)
+
+        self.refresh_plots()
+
+    def chart_config_item_changed(self, item):
+        if item.column() not in (2, 3):
+            return
+
+        title = item.data(QtCore.Qt.UserRole)
+        tab_index = item.column() - 2
+        if item.checkState() == QtCore.Qt.Checked:
+            self.chart_selections[tab_index].add(title)
+        else:
+            self.chart_selections[tab_index].discard(title)
+        self.rebuild_chart_tabs()
+
+    def set_chart_selection(self, tab_index, checked):
+        self.chart_config_table.blockSignals(True)
+        selected_titles = self.chart_selections[tab_index]
+        selected_titles.clear()
+        if checked:
+            selected_titles.update(title for title, _ in CHART_PLOT_DEFS)
+
+        check_state = QtCore.Qt.Checked if checked else QtCore.Qt.Unchecked
+        for title, _ in CHART_PLOT_DEFS:
+            self.chart_config_items[(tab_index, title)].setCheckState(check_state)
+        self.chart_config_table.blockSignals(False)
+        self.rebuild_chart_tabs()
 
     def build_debug_tab(self):
         layout = QtWidgets.QVBoxLayout(self.tab_debug)
@@ -191,6 +330,12 @@ class Ui_MainWindow(object):
         self.start.clicked.connect(self.start_prog); self.stop.clicked.connect(self.stop_prog); self.Reset.clicked.connect(self.reset_prog)
         self.btn_set_runtime.clicked.connect(self.set_runtime_params_clicked); self.btn_set_bike_params.clicked.connect(self.set_bike_params_clicked); self.btn_set_control_params.clicked.connect(self.set_control_params_clicked)
         self.btn_autorange.clicked.connect(self.autorange_plots); self.btn_reset_x.clicked.connect(lambda: setattr(self, 'scroll_mode', True))
+        self.btn_dump_charts.clicked.connect(self.dump_charts_clicked)
+        self.chart_config_table.itemChanged.connect(self.chart_config_item_changed)
+        self.btn_chart1_all.clicked.connect(lambda: self.set_chart_selection(0, True))
+        self.btn_chart1_clear.clicked.connect(lambda: self.set_chart_selection(0, False))
+        self.btn_chart2_all.clicked.connect(lambda: self.set_chart_selection(1, True))
+        self.btn_chart2_clear.clicked.connect(lambda: self.set_chart_selection(1, False))
 
     def refresh_ports(self):
         self.comboBox_portselect.clear(); ports = list(serial.tools.list_ports.comports())
@@ -272,12 +417,22 @@ class Ui_MainWindow(object):
         for key, row in self.control_param_rows.items():
             if key in control: row.set_actual(control[key]); row.set_target(control[key]) if update_targets else None
 
+    def queue_param_readback(self, session, label):
+        def worker():
+            try:
+                read_param_blocks_from_session(session, update_targets=False)
+                log_event(f"{label} readback done")
+            except Exception as e:
+                log_event(f"{label} readback failed: {type(e).__name__}: {e}")
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def set_runtime_params_clicked(self):
         session = get_active_vesc_session()
         if session is None: return
         try:
-            msg = SetBikeRuntime(); msg.gear_ratio_bike = self.runtime_gear_ratio.get_target(); msg.incline_deg = self.runtime_incline_deg.get_target(); msg.pumptrack_enabled = int(self.runtime_pumptrack_enabled.get_target()); msg.freewheel_enabled = int(self.runtime_freewheel_enabled.get_target()); msg.pumptrack_period_min = self.runtime_pumptrack_period.get_target()
-            session.send_custom_no_reply(fwd_msg(msg)); log_event("Runtime parameters sent")
+            msg = SetBikeRuntime(); msg.gear_ratio_bike = self.runtime_gear_ratio.get_target(); msg.p_incline_deg = self.runtime_incline_deg.get_target(); msg.pumptrack_enabled = int(self.runtime_pumptrack_enabled.get_target()); msg.freewheel_enabled = int(self.runtime_freewheel_enabled.get_target()); msg.pumptrack_period_min = self.runtime_pumptrack_period.get_target()
+            session.send_custom_no_reply(fwd_msg(msg)); log_event("Runtime parameters sent"); self.queue_param_readback(session, "Runtime parameters")
         except Exception as e: log_event(f"Set runtime failed: {type(e).__name__}: {e}")
 
     def set_bike_params_clicked(self):
@@ -286,7 +441,7 @@ class Ui_MainWindow(object):
         try:
             msg = SetBikeSimParams()
             for key, row in self.bike_param_rows.items(): setattr(msg, key, row.get_target())
-            session.send_custom_no_reply(fwd_msg(msg)); log_event("Bike parameters sent")
+            session.send_custom_no_reply(fwd_msg(msg)); log_event("Bike parameters sent"); self.queue_param_readback(session, "Bike parameters")
         except Exception as e: log_event(f"Set bike params failed: {type(e).__name__}: {e}")
 
     def set_control_params_clicked(self):
@@ -295,7 +450,7 @@ class Ui_MainWindow(object):
         try:
             msg = SetControlParams()
             for key, row in self.control_param_rows.items(): setattr(msg, key, row.get_target())
-            session.send_custom_no_reply(fwd_msg(msg)); log_event("Advanced parameters sent")
+            session.send_custom_no_reply(fwd_msg(msg)); log_event("Advanced parameters sent"); self.queue_param_readback(session, "Advanced parameters")
         except Exception as e: log_event(f"Set advanced params failed: {type(e).__name__}: {e}")
 
     def update_telemetry_table(self, values_dict):
@@ -320,6 +475,77 @@ class Ui_MainWindow(object):
 
     def autorange_plots(self):
         for p in self.chart_plots + [self.main_plot_torque, self.main_plot_speed]: p.autoRange()
+
+    def build_chart_dump(self):
+        with vesc_history_lock:
+            hist = {k: v[:] for k, v in state.vesc_history.items()}
+        with vesc_values_lock:
+            latest_values = dict(state.vesc_values)
+
+        t = hist.get("time_s", [])
+        relative_time_s = [ti - t[0] for ti in t] if t else []
+        chart_keys = []
+        for _, keys in MAIN_PLOT_DEFS + CHART_PLOT_DEFS:
+            chart_keys.extend(keys)
+        chart_keys = sorted(set(chart_keys))
+
+        series = {}
+        for key in chart_keys:
+            values = hist.get(key, [])
+            n = min(len(relative_time_s), len(values))
+            series[key] = {
+                "time_s": relative_time_s[:n],
+                "values": values[:n],
+            }
+
+        def chart_entries(plot_defs):
+            entries = []
+            for i, (title, keys) in enumerate(plot_defs):
+                row, col, colspan = self.chart_grid_position(i, len(plot_defs))
+                entries.append({
+                    "title": title,
+                    "row": row,
+                    "column": col,
+                    "column_span": colspan,
+                    "signals": list(keys),
+                })
+            return entries
+
+        return {
+            "generated_at_local": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "target_can_id": get_target_can_id(),
+            "plot_scroll_window_s": PLOT_SCROLL_WINDOW_S,
+            "scroll_mode": bool(self.scroll_mode),
+            "main_charts": chart_entries(MAIN_PLOT_DEFS),
+            "charts": chart_entries(CHART_PLOT_DEFS),
+            "chart_tabs": {
+                "chart_1": chart_entries(self.selected_chart_defs(0)),
+                "chart_2": chart_entries(self.selected_chart_defs(1)),
+            },
+            "latest_values": latest_values,
+            "diagnostics": get_diag_snapshot(),
+            "history_sample_count": len(relative_time_s),
+            "series": series,
+        }
+
+    def dump_charts_clicked(self):
+        filename = time.strftime("charts_dump_%Y%m%d_%H%M%S.json")
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self.tab_charts,
+            "Dump Charts",
+            filename,
+            "JSON Files (*.json);;All Files (*)",
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(self.build_chart_dump(), f, indent=2, allow_nan=True)
+            self.statusbar.showMessage(f"Charts dumped to {path}", 8000)
+            log_event(f"Charts dumped to {path}")
+        except Exception as e:
+            self.statusbar.showMessage(f"Chart dump failed: {e}", 8000)
+            log_event(f"Chart dump failed: {type(e).__name__}: {e}")
 
     def refresh_live_data(self):
         try:
@@ -349,7 +575,9 @@ class Ui_MainWindow(object):
         for key, curve in [("Pedal Torque Observed", self.main_curve_torque), ("Real Speed km/h", self.main_curve_speed)]:
             x, y = xy(key); curve.setData(x, y)
         self.main_plot_torque.setXRange(max(0.0, x_last - PLOT_SCROLL_WINDOW_S), max(PLOT_SCROLL_WINDOW_S, x_last), padding=0.0)
-        for key, curve in self.chart_curves.items():
-            x, y = xy(key, self.scroll_mode); curve.setData(x, y)
+        for key, curves in self.chart_curves.items():
+            x, y = xy(key, self.scroll_mode)
+            for curve in curves:
+                curve.setData(x, y)
         if self.scroll_mode:
             for p in self.chart_plots: p.setXRange(max(0.0, x_last - PLOT_SCROLL_WINDOW_S), max(PLOT_SCROLL_WINDOW_S, x_last), padding=0.0)

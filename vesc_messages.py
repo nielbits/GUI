@@ -104,10 +104,10 @@ class GetValuesExp(metaclass=VESCMessage):
 
 
 class GetBikeRuntime(metaclass=VESCMessage):
-    id = 166
+    id = 159
     fields = [
         ('gear_ratio_bike', 'i', 1000000),
-        ('incline_deg', 'i', 1000),
+        ('p_incline_deg', 'i', 1000),
         ('pumptrack_enabled', 'B', 1),
         ('freewheel_enabled', 'B', 1),
         ('pumptrack_period_min', 'i', 1000),
@@ -152,10 +152,10 @@ class GetControlParams(metaclass=VESCMessage):
 
 
 class SetBikeRuntime(metaclass=VESCMessage):
-    id = 165
+    id = 158
     fields = [
         ('gear_ratio_bike', 'i', 1000000),
-        ('incline_deg', 'i', 1000),
+        ('p_incline_deg', 'i', 1000),
         ('pumptrack_enabled', 'B', 1),
         ('freewheel_enabled', 'B', 1),
         ('pumptrack_period_min', 'i', 1000),

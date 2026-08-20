@@ -94,9 +94,9 @@ class ParamEditRow(QtWidgets.QWidget):
         return float(self.edit_target.text().strip())
 
 
-def make_plot(parent_widget, row, col, title):
+def make_plot(parent_widget, row, col, title, rowspan=1, colspan=1):
     axis_pen = pg.mkPen((180, 180, 180)); text_pen = (220, 220, 220)
-    plot = parent_widget.addPlot(row=row, col=col, title=title)
+    plot = parent_widget.addPlot(row=row, col=col, rowspan=rowspan, colspan=colspan, title=title)
     plot.showGrid(x=True, y=True, alpha=0.20)
     plot.getAxis('left').setPen(axis_pen); plot.getAxis('bottom').setPen(axis_pen)
     plot.getAxis('left').setTextPen(text_pen); plot.getAxis('bottom').setTextPen(text_pen)

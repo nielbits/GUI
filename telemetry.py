@@ -77,10 +77,12 @@ def build_vesc_values(response):
     position_error_deg = math.degrees(position_error_rad) / GM
     real_speed_kmh = estimate_real_speed_kmh(rpm_erpm, gear_ratio)
     setpoint_speed_kmh = estimate_setpoint_speed_kmh(model_speed, gear_ratio)
+    display_rpm_motor = -(rpm_erpm / POLE_PAIRS)
+    display_real_speed_kmh = -real_speed_kmh
 
     ctrl_sm_state = int(getattr(response, "ctrl_sm_state", 0))
     return {
-        "RPM Motor": rpm_erpm / POLE_PAIRS,
+        "RPM Motor": display_rpm_motor,
         "RPM Set": erpm_soll / POLE_PAIRS,
         "LESO RPM": float(getattr(response, "leso_omega", 0.0)) / POLE_PAIRS,
         "Motor Current": avg_motor_current,
@@ -93,7 +95,7 @@ def build_vesc_values(response):
         "T_friction": getattr(response, "tf", 0.0),
         "Gear Ratio": gear_ratio,
         "Setpoint Speed km/h": setpoint_speed_kmh,
-        "Real Speed km/h": real_speed_kmh,
+        "Real Speed km/h": display_real_speed_kmh,
         "F_combine": getattr(response, "f_combine", 0.0),
         "UW Theta": uw_theta,
         "Pedal Torque Observed": getattr(response, "tp_observed", 0.0),

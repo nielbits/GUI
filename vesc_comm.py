@@ -223,7 +223,9 @@ def get_control_params(vesc):
 
 
 def start_bike_sim(vesc):
-    vesc.send_custom_no_reply(fwd_msg(StartBikeSim()))
+    # pyvesc VESC.set_rpm() writes the command directly and returns None,
+    # so do not pass its result into send_custom_no_reply.
+    vesc.set_rpm(1000, can_id=get_target_can_id())
     log_event(f"COMM_START_BIKE_SIM sent to CAN ID {get_target_can_id()}")
 
 
@@ -268,7 +270,7 @@ def read_param_blocks_from_session(vesc, update_targets=False):
 
     # Validate types explicitly to avoid stale/wrong decoded packets.
     for obj, attrs, name in [
-        (runtime, ["gear_ratio_bike", "incline_deg"], "runtime"),
+        (runtime, ["gear_ratio_bike", "p_incline_deg"], "runtime"),
         (bike, ["p_air_ro", "p_weight"], "bike"),
         (control, ["p_fo_hz", "p_gz_hz"], "control"),
     ]:
@@ -279,7 +281,7 @@ def read_param_blocks_from_session(vesc, update_targets=False):
     with param_state_lock:
         param_state["runtime"] = {
             "gear_ratio_bike": float(runtime.gear_ratio_bike),
-            "incline_deg": float(runtime.incline_deg),
+            "incline_deg": float(runtime.p_incline_deg),
             "pumptrack_enabled": bool(runtime.pumptrack_enabled),
             "freewheel_enabled": bool(runtime.freewheel_enabled),
             "pumptrack_period_min": float(runtime.pumptrack_period_min),
@@ -384,9 +386,10 @@ def vesc_communication():
                 try:
                     with param_state_lock:
                         need_initial = bool(param_state["pending_initial_refresh"])
-                        param_state["pending_initial_refresh"] = False
                     if need_initial:
                         read_param_blocks_from_session(vesc, update_targets=True)
+                        with param_state_lock:
+                            param_state["pending_initial_refresh"] = False
                         next_param_refresh_time = time.perf_counter() + PARAM_REFRESH_PERIOD_S
                         log_event("Initial parameter refresh done")
                 except Exception as e:
@@ -476,7 +479,13 @@ def vesc_communication():
                     try:
                         now_after = time.perf_counter()
                         if now_after >= next_param_refresh_time:
-                            read_param_blocks_from_session(vesc, update_targets=False)
+                            with param_state_lock:
+                                update_targets = bool(param_state["pending_initial_refresh"])
+                            read_param_blocks_from_session(vesc, update_targets=update_targets)
+                            if update_targets:
+                                with param_state_lock:
+                                    param_state["pending_initial_refresh"] = False
+                                log_event("Initial parameter refresh done")
                             next_param_refresh_time = now_after + PARAM_REFRESH_PERIOD_S
                     except Exception as e:
                         log_event(f"Periodic parameter refresh failed: {type(e).__name__}: {e}")
